@@ -13,6 +13,17 @@ NetProbe pod or DaemonSet. The capture begins immediately on container start.
 
 ---
 
+## Storage credentials — what you provide vs what the pipeline fetches
+
+| Value | How it gets in |
+|---|---|
+| Storage account **name** | You enter it as the `storageAccountName` parameter at run time |
+| Storage account **key** | Pipeline fetches it automatically via `az storage account keys list` using the ARM service connection — you never paste the key anywhere |
+
+The key is injected into the `azure-storage-account-credentials-secret` Kubernetes secret on each run and is masked in all pipeline logs.
+
+---
+
 ## How to run
 
 1. Open **NetProbe — CD Deploy** → **Run pipeline**
@@ -20,7 +31,7 @@ NetProbe pod or DaemonSet. The capture begins immediately on container start.
 3. Click **Run**
 
 The pipeline will:
-1. Download the jumpbox SSH key from ADO Library and configure SSH
+1. Download the SSH key from ADO Library and configure SSH to the jumpbox
 2. Fetch the storage account key via the ARM service connection
 3. Upsert the `azure-storage-account-credentials-secret` in the target namespace (via jumpbox)
 4. Pull the `netprobe` helm chart from `https://thev1ndu.github.io/netprobe-helm` on the jumpbox
