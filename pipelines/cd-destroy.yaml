@@ -1,0 +1,64 @@
+trigger: none
+
+parameters:
+  - name: jumpboxHost
+    type: string
+    displayName: "Jumpbox Host (IP or hostname)"
+    default: "20.242.72.78"
+
+  - name: jumpboxUser
+    type: string
+    displayName: "Jumpbox SSH User"
+    default: "azureuser"
+
+  - name: releaseName
+    type: string
+    displayName: "Helm Release Name to uninstall  (the value used at deploy time)"
+
+  - name: namespace
+    type: string
+    displayName: "Kubernetes Namespace"
+    default: kube-system
+
+stages:
+  - stage: Destroy
+    displayName: Destroy NetProbe
+    jobs:
+      - job: DestroyNetProbe
+        displayName: helm uninstall netprobe
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: none
+
+          - task: DownloadSecureFile@1
+            name: hostKey
+            displayName: Download jumpbox SSH key
+            inputs:
+              secureFile: key
+
+          - bash: |
+              mkdir -p ~/.ssh
+              cp "$(hostKey.secureFilePath)" ~/.ssh/key
+              chmod 600 ~/.ssh/key
+              ssh-keyscan -H "${{ parameters.jumpboxHost }}" >> ~/.ssh/known_hosts
+            displayName: Configure SSH
+
+          - bash: |
+              ssh -i ~/.ssh/key \
+                "${{ parameters.jumpboxUser }}@${{ parameters.jumpboxHost }}" \
+                "helm uninstall ${{ parameters.releaseName }} \
+                   --namespace ${{ parameters.namespace }} \
+                   --wait --timeout 60s"
+            displayName: Helm uninstall
+
+          # Succeeds whether the resource was a Pod or DaemonSet;
+          # exits 0 if already gone (--ignore-not-found).
+          - bash: |
+              ssh -i ~/.ssh/key \
+                "${{ parameters.jumpboxUser }}@${{ parameters.jumpboxHost }}" \
+                "kubectl get pods,daemonsets \
+                   -l app.kubernetes.io/name=netprobe \
+                   -n ${{ parameters.namespace }} \
+                   --ignore-not-found"
+            displayName: Confirm resources removed

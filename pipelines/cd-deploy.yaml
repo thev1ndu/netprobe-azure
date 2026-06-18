@@ -1,0 +1,197 @@
+trigger: none
+
+parameters:
+  - name: azureServiceConnection
+    type: string
+    displayName: "Azure Resource Manager Service Connection"
+
+  - name: aksResourceGroup
+    type: string
+    displayName: "AKS Resource Group  (must contain the storage account)"
+
+  - name: jumpboxHost
+    type: string
+    displayName: "Jumpbox Host (IP or hostname)"
+    default: "20.242.72.78"
+
+  - name: jumpboxUser
+    type: string
+    displayName: "Jumpbox SSH User"
+    default: "azureuser"
+
+  - name: storageAccountName
+    type: string
+    displayName: "Storage Account Name"
+
+  - name: namespace
+    type: string
+    displayName: "Kubernetes Namespace"
+    default: kube-system
+
+  - name: deploymentMode
+    type: string
+    displayName: "Deployment Mode"
+    default: pod
+    values:
+      - pod
+      - daemonset
+
+  - name: captureMode
+    type: string
+    displayName: "Capture Mode  (tcpdump = auto-start capture | shell = kubectl exec only)"
+    default: tcpdump
+    values:
+      - tcpdump
+      - shell
+
+  - name: releaseName
+    type: string
+    displayName: "Helm Release Name  (also used as the Pod name in pod mode)"
+    default: netprobe
+
+  - name: nodeName
+    type: string
+    displayName: "Target Node Name  (pod mode only — leave blank to let scheduler pick)"
+    default: ""
+
+  - name: imageDigest
+    type: string
+    displayName: "Image Digest  (sha256:... — leave blank to use the digest baked into the chart)"
+    default: ""
+
+  - name: shareName
+    type: string
+    displayName: "Azure File Share Name"
+    default: fileshare
+
+  - name: tcpdumpInterface
+    type: string
+    displayName: "Network Interface"
+    default: any
+    values:
+      - any
+      - eth0
+
+  - name: tcpdumpRotateSeconds
+    type: number
+    displayName: "Rotate .pcap every N seconds  (60 | 300 | 600)"
+    default: 300
+
+  - name: tcpdumpFilterHost
+    type: string
+    displayName: "BPF Host Filter  (e.g. 10.0.0.1 or apigw.example.com) — blank = all traffic"
+    default: ""
+
+  - name: tcpdumpFilePrefix
+    type: string
+    displayName: "Output File Prefix"
+    default: capture
+
+  - name: tcpdumpVerbose
+    type: boolean
+    displayName: "Verbose mode  (print to stdout only, no .pcap file written)"
+    default: false
+
+stages:
+  - stage: Deploy
+    displayName: Deploy NetProbe
+    jobs:
+      - job: DeployNetProbe
+        displayName: helm upgrade --install netprobe
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: none
+
+          - task: DownloadSecureFile@1
+            name: hostKey
+            displayName: Download jumpbox SSH key
+            inputs:
+              secureFile: key
+
+          - bash: |
+              mkdir -p ~/.ssh
+              cp "$(hostKey.secureFilePath)" ~/.ssh/key
+              chmod 600 ~/.ssh/key
+              ssh-keyscan -H "${{ parameters.jumpboxHost }}" >> ~/.ssh/known_hosts
+            displayName: Configure SSH
+
+          - task: AzureCLI@2
+            displayName: Fetch storage account key
+            inputs:
+              azureSubscription: ${{ parameters.azureServiceConnection }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                KEY=$(az storage account keys list \
+                  --resource-group "${{ parameters.aksResourceGroup }}" \
+                  --account-name "${{ parameters.storageAccountName }}" \
+                  --query "[0].value" -o tsv)
+                echo "##vso[task.setvariable variable=storageAccountKey;issecret=true]$KEY"
+
+          - bash: |
+              cat > "$(Agent.TempDirectory)/storage-secret.yaml" <<'EOF'
+              apiVersion: v1
+              kind: Secret
+              metadata:
+                name: azure-storage-account-credentials-secret
+                namespace: ${{ parameters.namespace }}
+              type: Opaque
+              stringData:
+                azurestorageaccountname: "${{ parameters.storageAccountName }}"
+                azurestorageaccountkey: "$(storageAccountKey)"
+              EOF
+            displayName: Generate storage secret manifest
+
+          - bash: |
+              REMOTE_SECRET="/tmp/netprobe-secret-$(Build.BuildId).yaml"
+              scp -i ~/.ssh/key \
+                "$(Agent.TempDirectory)/storage-secret.yaml" \
+                "${{ parameters.jumpboxUser }}@${{ parameters.jumpboxHost }}:${REMOTE_SECRET}"
+              ssh -i ~/.ssh/key \
+                "${{ parameters.jumpboxUser }}@${{ parameters.jumpboxHost }}" \
+                "kubectl apply -f ${REMOTE_SECRET} && rm ${REMOTE_SECRET}"
+            displayName: Upsert storage secret
+
+          - script: |
+              OVERRIDES=(
+                "deploymentMode=${{ parameters.deploymentMode }}"
+                "captureMode=${{ parameters.captureMode }}"
+                "pod.name=${{ parameters.releaseName }}"
+                "azureFileShare.shareName=${{ parameters.shareName }}"
+                "tcpdump.interface=${{ parameters.tcpdumpInterface }}"
+                "tcpdump.rotateSeconds=${{ parameters.tcpdumpRotateSeconds }}"
+                "tcpdump.filterHost=${{ parameters.tcpdumpFilterHost }}"
+                "tcpdump.filePrefix=${{ parameters.tcpdumpFilePrefix }}"
+                "tcpdump.verbose=${{ parameters.tcpdumpVerbose }}"
+              )
+
+              if [ -n "${{ parameters.nodeName }}" ]; then
+                OVERRIDES+=("pod.nodeName=${{ parameters.nodeName }}")
+              fi
+
+              if [ -n "${{ parameters.imageDigest }}" ]; then
+                OVERRIDES+=("image.digest=${{ parameters.imageDigest }}")
+              fi
+
+              OVERRIDE_STR=$(IFS=,; echo "${OVERRIDES[*]}")
+              echo "##vso[task.setvariable variable=helmOverrides]$OVERRIDE_STR"
+              echo "Helm overrides: $OVERRIDE_STR"
+            displayName: Build helm overrides
+
+          - bash: |
+              ssh -i ~/.ssh/key \
+                "${{ parameters.jumpboxUser }}@${{ parameters.jumpboxHost }}" \
+                "helm repo add netprobe https://thev1ndu.github.io/netprobe-helm --force-update && \
+                 helm repo update netprobe && \
+                 helm upgrade --install ${{ parameters.releaseName }} netprobe/netprobe \
+                   --namespace ${{ parameters.namespace }} \
+                   --set $(helmOverrides) \
+                   --timeout 120s --atomic --wait"
+            displayName: Helm upgrade --install
+
+          - bash: |
+              ssh -i ~/.ssh/key \
+                "${{ parameters.jumpboxUser }}@${{ parameters.jumpboxHost }}" \
+                "kubectl get pods -l app.kubernetes.io/name=netprobe -n ${{ parameters.namespace }} -o wide"
+            displayName: Show pod status
