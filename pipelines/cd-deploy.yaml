@@ -54,6 +54,11 @@ parameters:
     displayName: "Target Node Name  (pod mode only — leave blank to let scheduler pick)"
     default: ""
 
+  - name: imageRegistry
+    type: string
+    displayName: "Container Registry  (e.g. myacr.azurecr.io)"
+    default: ""
+
   - name: imageDigest
     type: string
     displayName: "Image Digest  (sha256:... — leave blank to use the digest baked into the chart)"
@@ -170,6 +175,10 @@ stages:
 
               if [ -n "${{ parameters.nodeName }}" ]; then
                 OVERRIDES+=("pod.nodeName=${{ parameters.nodeName }}")
+              fi
+
+              if [ -n "${{ parameters.imageRegistry }}" ]; then
+                OVERRIDES+=("image.registry=${{ parameters.imageRegistry }}")
               fi
 
               if [ -n "${{ parameters.imageDigest }}" ]; then
