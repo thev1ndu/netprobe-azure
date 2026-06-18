@@ -146,6 +146,67 @@ az storage directory show \
 
 ---
 
+## 5. Jumpbox VMSS network requirements
+
+The jumpbox VMSS must be in the **same VNet** as the AKS cluster. It does **not** need to be in the same subnet.
+
+Since AKS is a private cluster, its API server is exposed as a private endpoint with a private IP inside the VNet. The private DNS zone (e.g. `privatelink.<region>.azmk8s.io`) is linked at the **VNet level**, so every subnet in the VNet can resolve and reach the API server endpoint — including the jumpbox subnet.
+
+```
+Jumpbox VMSS (any subnet in the VNet)
+  → private DNS resolves → AKS private API server IP (VNet-internal)
+    → API server
+```
+
+The `az vmss run-command invoke` call itself goes through the Azure control plane (ARM API) and has no VNet requirements — the ADO Microsoft-hosted agent sends commands to the VMSS via `management.azure.com` regardless of network topology.
+
+### Verify the jumpbox can reach the AKS API server
+
+```bash
+az vmss run-command invoke \
+  --resource-group <vmss-rg> \
+  --name <vmss-name> \
+  --instance-id 0 \
+  --command-id RunShellScript \
+  --scripts "kubectl cluster-info"
+```
+
+### NSG check — outbound port 443 from the jumpbox subnet
+
+If the jumpbox subnet has a custom NSG, confirm outbound TCP 443 to the AKS private API server IP is not blocked:
+
+```bash
+# Find the AKS private API server IP
+az network private-endpoint list \
+  --resource-group $RG \
+  --query "[?contains(name,'aks')].customDnsConfigs[0].ipAddresses[0]" \
+  -o tsv
+
+# List outbound NSG rules on the jumpbox subnet
+az network nsg rule list \
+  --resource-group $RG \
+  --nsg-name <jumpbox-nsg-name> \
+  --query "[?direction=='Outbound'].{name:name,priority:priority,access:access,destPort:destinationPortRange}" \
+  -o table
+```
+
+If port 443 is denied, add an allow rule:
+
+```bash
+az network nsg rule create \
+  --resource-group $RG \
+  --nsg-name <jumpbox-nsg-name> \
+  --name Allow-AKS-API-443 \
+  --priority 200 \
+  --direction Outbound \
+  --access Allow \
+  --protocol Tcp \
+  --destination-address-prefixes <aks-api-private-ip> \
+  --destination-port-ranges 443
+```
+
+---
+
 ## Summary
 
 After this document you have:
@@ -155,5 +216,7 @@ After this document you have:
 - [ ] Storage Account created (or confirmed existing)
 - [ ] `$STORAGE_KEY` in your shell session
 - [ ] File Share `fileshare` created with a `dumps/` directory
+- [ ] Jumpbox VMSS confirmed in the same VNet as AKS (any subnet is fine)
+- [ ] Jumpbox subnet NSG allows outbound TCP 443 to the AKS private API server IP
 
 Next: [02-ado-setup.md](02-ado-setup.md)

@@ -9,15 +9,19 @@ parameters:
     type: string
     displayName: "AKS Resource Group  (must contain the storage account)"
 
-  - name: jumpboxHost
+  - name: vmssName
     type: string
-    displayName: "Jumpbox Host (IP or hostname)"
-    default: "20.242.72.78"
+    displayName: "Jumpbox VMSS Name"
 
-  - name: jumpboxUser
+  - name: vmssResourceGroup
     type: string
-    displayName: "Jumpbox SSH User"
-    default: "azureuser"
+    displayName: "Jumpbox VMSS Resource Group  (leave blank to use AKS Resource Group)"
+    default: ""
+
+  - name: vmssInstanceId
+    type: string
+    displayName: "VMSS Instance ID  (0 for the first instance)"
+    default: "0"
 
   - name: storageAccountName
     type: string
@@ -108,19 +112,6 @@ stages:
         steps:
           - checkout: none
 
-          - task: DownloadSecureFile@1
-            name: hostKey
-            displayName: Download jumpbox SSH key
-            inputs:
-              secureFile: key.pem
-
-          - bash: |
-              mkdir -p ~/.ssh
-              cp "$(hostKey.secureFilePath)" ~/.ssh/key
-              chmod 600 ~/.ssh/key
-              ssh-keyscan -H "${{ parameters.jumpboxHost }}" >> ~/.ssh/known_hosts
-            displayName: Configure SSH
-
           - task: AzureCLI@2
             displayName: Fetch storage account key
             inputs:
@@ -133,30 +124,6 @@ stages:
                   --account-name "${{ parameters.storageAccountName }}" \
                   --query "[0].value" -o tsv)
                 echo "##vso[task.setvariable variable=storageAccountKey;issecret=true]$KEY"
-
-          - bash: |
-              cat > "$(Agent.TempDirectory)/storage-secret.yaml" <<'EOF'
-              apiVersion: v1
-              kind: Secret
-              metadata:
-                name: azure-storage-account-credentials-secret
-                namespace: ${{ parameters.namespace }}
-              type: Opaque
-              stringData:
-                azurestorageaccountname: "${{ parameters.storageAccountName }}"
-                azurestorageaccountkey: "$(storageAccountKey)"
-              EOF
-            displayName: Generate storage secret manifest
-
-          - bash: |
-              REMOTE_SECRET="/tmp/netprobe-secret-$(Build.BuildId).yaml"
-              scp -i ~/.ssh/key \
-                "$(Agent.TempDirectory)/storage-secret.yaml" \
-                "${{ parameters.jumpboxUser }}@${{ parameters.jumpboxHost }}:${REMOTE_SECRET}"
-              ssh -i ~/.ssh/key \
-                "${{ parameters.jumpboxUser }}@${{ parameters.jumpboxHost }}" \
-                "kubectl apply -f ${REMOTE_SECRET} && rm ${REMOTE_SECRET}"
-            displayName: Upsert storage secret
 
           - script: |
               FILTER_HOST="${{ parameters.tcpdumpFilterHost }}"
@@ -190,20 +157,114 @@ stages:
               echo "Helm overrides: $OVERRIDE_STR"
             displayName: Build helm overrides
 
-          - bash: |
-              ssh -i ~/.ssh/key \
-                "${{ parameters.jumpboxUser }}@${{ parameters.jumpboxHost }}" \
-                "wget -q -O /tmp/netprobe-0.1.0.tgz \
-                   https://github.com/thev1ndu/netprobe-helm/releases/download/netprobe-0.1.0/netprobe-0.1.0.tgz && \
-                 helm upgrade --install ${{ parameters.releaseName }} /tmp/netprobe-0.1.0.tgz \
-                   --namespace ${{ parameters.namespace }} \
-                   --set \"$(helmOverrides)\" \
-                   --timeout 120s --rollback-on-failure --wait && \
-                 rm /tmp/netprobe-0.1.0.tgz"
-            displayName: Helm upgrade --install
+          - task: AzureCLI@2
+            displayName: Upsert storage secret
+            inputs:
+              azureSubscription: ${{ parameters.azureServiceConnection }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                VMSS_RG="${{ parameters.vmssResourceGroup }}"
+                [ -z "$VMSS_RG" ] && VMSS_RG="${{ parameters.aksResourceGroup }}"
 
-          - bash: |
-              ssh -i ~/.ssh/key \
-                "${{ parameters.jumpboxUser }}@${{ parameters.jumpboxHost }}" \
-                "kubectl get pods -l app.kubernetes.io/name=netprobe -n ${{ parameters.namespace }} -o wide"
+                REMOTE_SCRIPT=$(cat <<'SCRIPT'
+                trap 'echo "##exit:$?"' EXIT
+                set -euo pipefail
+                SANAME="$1"
+                SAKEY="$2"
+                NS="$3"
+                kubectl create secret generic azure-storage-account-credentials-secret \
+                  --namespace "$NS" \
+                  --from-literal=azurestorageaccountname="$SANAME" \
+                  --from-literal=azurestorageaccountkey="$SAKEY" \
+                  --dry-run=client -o yaml | kubectl apply -f -
+                SCRIPT
+                )
+
+                OUTPUT=$(az vmss run-command invoke \
+                  --resource-group "$VMSS_RG" \
+                  --name "${{ parameters.vmssName }}" \
+                  --instance-id "${{ parameters.vmssInstanceId }}" \
+                  --command-id RunShellScript \
+                  --scripts "$REMOTE_SCRIPT" \
+                  --parameters "${{ parameters.storageAccountName }}" "$(storageAccountKey)" "${{ parameters.namespace }}" \
+                  --output json)
+
+                echo "$OUTPUT" | python3 -c "
+                import sys, json
+                data = json.load(sys.stdin)
+                msg = data['value'][0]['message']
+                print(msg)
+                exit_code = 0
+                for line in msg.split('\n'):
+                    if '##exit:' in line:
+                        try: exit_code = int(line.split('##exit:')[1].strip())
+                        except: pass
+                sys.exit(exit_code)
+                "
+
+          - task: AzureCLI@2
+            displayName: Helm upgrade --install
+            inputs:
+              azureSubscription: ${{ parameters.azureServiceConnection }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                VMSS_RG="${{ parameters.vmssResourceGroup }}"
+                [ -z "$VMSS_RG" ] && VMSS_RG="${{ parameters.aksResourceGroup }}"
+
+                CHART_URL="https://github.com/thev1ndu/netprobe-helm/releases/download/netprobe-0.1.0/netprobe-0.1.0.tgz"
+
+                REMOTE_SCRIPT="trap 'echo ##exit:\$?' EXIT
+                set -euo pipefail
+                wget -q -O /tmp/netprobe-0.1.0.tgz \"${CHART_URL}\"
+                helm upgrade --install \"${{ parameters.releaseName }}\" /tmp/netprobe-0.1.0.tgz \
+                  --namespace \"${{ parameters.namespace }}\" \
+                  --set \"$(helmOverrides)\" \
+                  --timeout 120s --rollback-on-failure --wait
+                rm /tmp/netprobe-0.1.0.tgz"
+
+                OUTPUT=$(az vmss run-command invoke \
+                  --resource-group "$VMSS_RG" \
+                  --name "${{ parameters.vmssName }}" \
+                  --instance-id "${{ parameters.vmssInstanceId }}" \
+                  --command-id RunShellScript \
+                  --scripts "$REMOTE_SCRIPT" \
+                  --output json)
+
+                echo "$OUTPUT" | python3 -c "
+                import sys, json
+                data = json.load(sys.stdin)
+                msg = data['value'][0]['message']
+                print(msg)
+                exit_code = 0
+                for line in msg.split('\n'):
+                    if '##exit:' in line:
+                        try: exit_code = int(line.split('##exit:')[1].strip())
+                        except: pass
+                sys.exit(exit_code)
+                "
+
+          - task: AzureCLI@2
             displayName: Show pod status
+            inputs:
+              azureSubscription: ${{ parameters.azureServiceConnection }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                VMSS_RG="${{ parameters.vmssResourceGroup }}"
+                [ -z "$VMSS_RG" ] && VMSS_RG="${{ parameters.aksResourceGroup }}"
+
+                OUTPUT=$(az vmss run-command invoke \
+                  --resource-group "$VMSS_RG" \
+                  --name "${{ parameters.vmssName }}" \
+                  --instance-id "${{ parameters.vmssInstanceId }}" \
+                  --command-id RunShellScript \
+                  --scripts "kubectl get pods -l app.kubernetes.io/name=netprobe -n ${{ parameters.namespace }} -o wide" \
+                  --output json)
+
+                echo "$OUTPUT" | python3 -c "
+                import sys, json
+                data = json.load(sys.stdin)
+                print(data['value'][0]['message'])
+                "

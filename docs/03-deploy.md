@@ -9,7 +9,7 @@ NetProbe pod or DaemonSet. The capture begins immediately on container start.
 
 - [02-ado-setup.md](02-ado-setup.md) completed
 - Image pushed to ACR (see [aks-node-tcpdump CI](https://github.com/thev1ndu/aks-node-tcpdump))
-- Jumpbox has outbound HTTPS to `thev1ndu.github.io` (helm chart is pulled from there at deploy time)
+- Jumpbox VMSS instance has outbound HTTPS to `thev1ndu.github.io` (helm chart is pulled from there at deploy time)
 
 ---
 
@@ -20,7 +20,7 @@ NetProbe pod or DaemonSet. The capture begins immediately on container start.
 | Storage account **name** | You enter it as the `storageAccountName` parameter at run time |
 | Storage account **key** | Pipeline fetches it automatically via `az storage account keys list` using the ARM service connection — you never paste the key anywhere |
 
-The key is injected into the `azure-storage-account-credentials-secret` Kubernetes secret on each run and is masked in all pipeline logs.
+The key is passed to the VMSS run-command via `--parameters` and is masked in all ADO pipeline logs.
 
 ---
 
@@ -31,12 +31,11 @@ The key is injected into the `azure-storage-account-credentials-secret` Kubernet
 3. Click **Run**
 
 The pipeline will:
-1. Download the SSH key from ADO Library and configure SSH to the jumpbox
-2. Fetch the storage account key via the ARM service connection
-3. Upsert the `azure-storage-account-credentials-secret` in the target namespace (via jumpbox)
-4. Pull the `netprobe` helm chart from `https://thev1ndu.github.io/netprobe-helm` on the jumpbox
-5. Run `helm upgrade --install` on the jumpbox with the parameters you provided
-6. Print pod status once Helm reports success
+1. Fetch the storage account key via the ARM service connection
+2. Upsert the `azure-storage-account-credentials-secret` in the target namespace (via `az vmss run-command invoke` on the jumpbox)
+3. Pull the `netprobe` helm chart from `https://thev1ndu.github.io/netprobe-helm` on the jumpbox
+4. Run `helm upgrade --install` on the jumpbox with the parameters you provided
+5. Print pod status once Helm reports success
 
 ---
 
@@ -46,8 +45,9 @@ The pipeline will:
 |---|---|---|---|
 | `azureServiceConnection` | yes | — | ARM Service Connection name from step 1 of ADO setup |
 | `aksResourceGroup` | yes | — | Azure resource group containing the AKS cluster and storage account |
-| `jumpboxHost` | no | `20.242.72.78` | Jumpbox public IP or hostname |
-| `jumpboxUser` | no | `azureuser` | SSH username for the jumpbox |
+| `vmssName` | yes | — | Name of the jumpbox VMSS |
+| `vmssResourceGroup` | no | _(uses `aksResourceGroup`)_ | Resource group of the jumpbox VMSS — leave blank if same as `aksResourceGroup` |
+| `vmssInstanceId` | no | `0` | VMSS instance ID to run commands on (0 = first instance) |
 | `storageAccountName` | yes | — | Azure Storage Account name; key is fetched automatically via the ARM service connection |
 | `namespace` | no | `kube-system` | Kubernetes namespace to deploy into |
 | `deploymentMode` | no | `pod` | `pod` = pin to one node · `daemonset` = all nodes |
@@ -71,6 +71,7 @@ The pipeline will:
 ```
 azureServiceConnection: sc-arm-<resourcegroup>
 aksResourceGroup:      <your-resource-group>
+vmssName:              <your-jumpbox-vmss-name>
 storageAccountName:    <your-storage-account>
 deploymentMode:        pod
 releaseName:           debug-node-1
@@ -83,6 +84,7 @@ tcpdumpRotateSeconds:  300
 ```
 azureServiceConnection: sc-arm-<resourcegroup>
 aksResourceGroup:      <your-resource-group>
+vmssName:              <your-jumpbox-vmss-name>
 storageAccountName:    <your-storage-account>
 deploymentMode:        pod
 releaseName:           debug-apigw
@@ -97,6 +99,7 @@ tcpdumpRotateSeconds:  300
 ```
 azureServiceConnection: sc-arm-<resourcegroup>
 aksResourceGroup:      <your-resource-group>
+vmssName:              <your-jumpbox-vmss-name>
 storageAccountName:    <your-storage-account>
 deploymentMode:        daemonset
 releaseName:           netprobe-all-nodes
@@ -111,13 +114,14 @@ overwrite each other on the share.
 ```
 azureServiceConnection: sc-arm-<resourcegroup>
 aksResourceGroup:      <your-resource-group>
+vmssName:              <your-jumpbox-vmss-name>
 storageAccountName:    <your-storage-account>
 captureMode:           shell
 releaseName:           debug-shell
 nodeName:              aks-aksnpuser-72792323-vmss00001m
 ```
 
-Then from the jumpbox (or any host with kubectl access to the cluster):
+Then from the jumpbox (connect via Azure Bastion or serial console):
 
 ```bash
 kubectl exec -it debug-shell -n kube-system -- /bin/bash
@@ -143,7 +147,7 @@ imageDigest:   sha256:<new-digest-from-CI>
 
 ## Post-deploy checks
 
-Run these from the jumpbox (SSH in first: `ssh azureuser@<jumpbox-ip>`):
+Run these by invoking a run-command on the jumpbox, or connect to it via Azure Bastion:
 
 ```bash
 # Stream tcpdump output — pod mode
@@ -161,6 +165,17 @@ az storage file list \
   --share-name fileshare \
   --path dumps \
   --output table
+```
+
+Or issue a one-off run-command from the ADO agent / your local machine (requires ARM credentials):
+
+```bash
+az vmss run-command invoke \
+  --resource-group <vmss-rg> \
+  --name <vmss-name> \
+  --instance-id 0 \
+  --command-id RunShellScript \
+  --scripts "kubectl logs -f <releaseName> -n kube-system"
 ```
 
 ---

@@ -13,11 +13,15 @@ persist until you remove them manually.
 - The deploy pipeline has been run at least once
 - You know the exact `releaseName` used at deploy time
 
-  If you are not sure, check running releases from the jumpbox:
+  If you are not sure, check running releases via run-command:
 
   ```bash
-  ssh azureuser@<jumpbox-ip>
-  helm list -n kube-system | grep netprobe
+  az vmss run-command invoke \
+    --resource-group <vmss-rg> \
+    --name <vmss-name> \
+    --instance-id 0 \
+    --command-id RunShellScript \
+    --scripts "helm list -n kube-system | grep netprobe"
   ```
 
 ---
@@ -81,8 +85,10 @@ tshark -r capture.pcap -z follow,tcp,ascii,0
 
 | Parameter | Required | Default | Description |
 |---|---|---|---|
-| `jumpboxHost` | no | `20.242.72.78` | Jumpbox public IP or hostname |
-| `jumpboxUser` | no | `azureuser` | SSH username for the jumpbox |
+| `azureServiceConnection` | yes | — | ARM Service Connection name from step 1 of ADO setup |
+| `vmssName` | yes | — | Name of the jumpbox VMSS |
+| `vmssResourceGroup` | yes | — | Resource group of the jumpbox VMSS |
+| `vmssInstanceId` | no | `0` | VMSS instance ID to run commands on |
 | `releaseName` | yes | — | The exact `releaseName` value used when the deploy pipeline was run |
 | `namespace` | no | `kube-system` | Must match the namespace used at deploy time |
 
@@ -93,16 +99,15 @@ tshark -r capture.pcap -z follow,tcp,ascii,0
 
 ## 3. Verify cleanup
 
-After the pipeline succeeds, confirm from the jumpbox:
+After the pipeline succeeds, confirm via run-command:
 
 ```bash
-ssh azureuser@<jumpbox-ip>
-
-# Should return nothing
-kubectl get pods -l app.kubernetes.io/name=netprobe -n kube-system
-
-# Should show no releases
-helm list -n kube-system | grep netprobe
+az vmss run-command invoke \
+  --resource-group <vmss-rg> \
+  --name <vmss-name> \
+  --instance-id 0 \
+  --command-id RunShellScript \
+  --scripts "kubectl get pods -l app.kubernetes.io/name=netprobe -n kube-system; helm list -n kube-system | grep netprobe"
 ```
 
 DaemonSet pods terminate on each node independently — if pods linger briefly, wait

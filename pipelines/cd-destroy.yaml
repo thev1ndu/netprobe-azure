@@ -1,15 +1,22 @@
 trigger: none
 
 parameters:
-  - name: jumpboxHost
+  - name: azureServiceConnection
     type: string
-    displayName: "Jumpbox Host (IP or hostname)"
-    default: "20.242.72.78"
+    displayName: "Azure Resource Manager Service Connection"
 
-  - name: jumpboxUser
+  - name: vmssName
     type: string
-    displayName: "Jumpbox SSH User"
-    default: "azureuser"
+    displayName: "Jumpbox VMSS Name"
+
+  - name: vmssResourceGroup
+    type: string
+    displayName: "Jumpbox VMSS Resource Group"
+
+  - name: vmssInstanceId
+    type: string
+    displayName: "VMSS Instance ID  (0 for the first instance)"
+    default: "0"
 
   - name: releaseName
     type: string
@@ -31,34 +38,62 @@ stages:
         steps:
           - checkout: none
 
-          - task: DownloadSecureFile@1
-            name: hostKey
-            displayName: Download jumpbox SSH key
-            inputs:
-              secureFile: key.pem
-
-          - bash: |
-              mkdir -p ~/.ssh
-              cp "$(hostKey.secureFilePath)" ~/.ssh/key
-              chmod 600 ~/.ssh/key
-              ssh-keyscan -H "${{ parameters.jumpboxHost }}" >> ~/.ssh/known_hosts
-            displayName: Configure SSH
-
-          - bash: |
-              ssh -i ~/.ssh/key \
-                "${{ parameters.jumpboxUser }}@${{ parameters.jumpboxHost }}" \
-                "helm uninstall ${{ parameters.releaseName }} \
-                   --namespace ${{ parameters.namespace }} \
-                   --wait --timeout 60s"
+          - task: AzureCLI@2
             displayName: Helm uninstall
+            inputs:
+              azureSubscription: ${{ parameters.azureServiceConnection }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                REMOTE_SCRIPT="trap 'echo ##exit:\$?' EXIT
+                set -euo pipefail
+                helm uninstall \"${{ parameters.releaseName }}\" \
+                  --namespace \"${{ parameters.namespace }}\" \
+                  --wait --timeout 60s"
+
+                OUTPUT=$(az vmss run-command invoke \
+                  --resource-group "${{ parameters.vmssResourceGroup }}" \
+                  --name "${{ parameters.vmssName }}" \
+                  --instance-id "${{ parameters.vmssInstanceId }}" \
+                  --command-id RunShellScript \
+                  --scripts "$REMOTE_SCRIPT" \
+                  --output json)
+
+                echo "$OUTPUT" | python3 -c "
+                import sys, json
+                data = json.load(sys.stdin)
+                msg = data['value'][0]['message']
+                print(msg)
+                exit_code = 0
+                for line in msg.split('\n'):
+                    if '##exit:' in line:
+                        try: exit_code = int(line.split('##exit:')[1].strip())
+                        except: pass
+                sys.exit(exit_code)
+                "
 
           # Succeeds whether the resource was a Pod or DaemonSet;
           # exits 0 if already gone (--ignore-not-found).
-          - bash: |
-              ssh -i ~/.ssh/key \
-                "${{ parameters.jumpboxUser }}@${{ parameters.jumpboxHost }}" \
-                "kubectl get pods,daemonsets \
-                   -l app.kubernetes.io/name=netprobe \
-                   -n ${{ parameters.namespace }} \
-                   --ignore-not-found"
+          - task: AzureCLI@2
             displayName: Confirm resources removed
+            inputs:
+              azureSubscription: ${{ parameters.azureServiceConnection }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                OUTPUT=$(az vmss run-command invoke \
+                  --resource-group "${{ parameters.vmssResourceGroup }}" \
+                  --name "${{ parameters.vmssName }}" \
+                  --instance-id "${{ parameters.vmssInstanceId }}" \
+                  --command-id RunShellScript \
+                  --scripts "kubectl get pods,daemonsets \
+                    -l app.kubernetes.io/name=netprobe \
+                    -n ${{ parameters.namespace }} \
+                    --ignore-not-found" \
+                  --output json)
+
+                echo "$OUTPUT" | python3 -c "
+                import sys, json
+                data = json.load(sys.stdin)
+                print(data['value'][0]['message'])
+                "
