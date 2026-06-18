@@ -80,7 +80,7 @@ parameters:
   - name: tcpdumpFilterHost
     type: string
     displayName: "BPF Host Filter  (e.g. 10.0.0.1 or apigw.example.com) — blank = all traffic"
-    default: ""
+    default: " "
 
   - name: tcpdumpFilePrefix
     type: string
@@ -107,7 +107,7 @@ stages:
             name: hostKey
             displayName: Download jumpbox SSH key
             inputs:
-              secureFile: key
+              secureFile: key.pem
 
           - bash: |
               mkdir -p ~/.ssh
