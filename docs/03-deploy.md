@@ -45,9 +45,10 @@ The pipeline will:
 |---|---|---|---|
 | `azureServiceConnection` | yes | — | ARM Service Connection name from step 1 of ADO setup |
 | `aksResourceGroup` | yes | — | Azure resource group containing the AKS cluster and storage account |
-| `vmssName` | yes | — | Name of the jumpbox VMSS |
-| `vmssResourceGroup` | no | _(uses `aksResourceGroup`)_ | Resource group of the jumpbox VMSS — leave blank if same as `aksResourceGroup` |
-| `vmssInstanceId` | no | `0` | VMSS instance ID to run commands on (0 = first instance) |
+| `jumpboxType` | no | `vmss` | `vmss` = Virtual Machine Scale Set · `vm` = plain VM |
+| `vmssName` | yes | — | Name of the jumpbox VM or VMSS |
+| `vmssResourceGroup` | no | _(uses `aksResourceGroup`)_ | Resource group of the jumpbox — leave blank if same as `aksResourceGroup` |
+| `vmssInstanceId` | no | `0` | VMSS instance ID (ignored when `jumpboxType` is `vm`) |
 | `storageAccountName` | yes | — | Azure Storage Account name; key is fetched automatically via the ARM service connection |
 | `namespace` | no | `kube-system` | Kubernetes namespace to deploy into |
 | `deploymentMode` | no | `pod` | `pod` = pin to one node · `daemonset` = all nodes |

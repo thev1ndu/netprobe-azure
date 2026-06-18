@@ -5,17 +5,25 @@ parameters:
     type: string
     displayName: "Azure Resource Manager Service Connection"
 
+  - name: jumpboxType
+    type: string
+    displayName: "Jumpbox Type  (vmss = Virtual Machine Scale Set | vm = plain VM)"
+    default: vmss
+    values:
+      - vmss
+      - vm
+
   - name: vmssName
     type: string
-    displayName: "Jumpbox VMSS Name"
+    displayName: "Jumpbox VM or VMSS Name"
 
   - name: vmssResourceGroup
     type: string
-    displayName: "Jumpbox VMSS Resource Group"
+    displayName: "Jumpbox Resource Group"
 
   - name: vmssInstanceId
     type: string
-    displayName: "VMSS Instance ID  (0 for the first instance)"
+    displayName: "VMSS Instance ID  (0 for the first instance — ignored for plain VM)"
     default: "0"
 
   - name: releaseName
@@ -51,10 +59,18 @@ stages:
                   --namespace \"${{ parameters.namespace }}\" \
                   --wait --timeout 60s"
 
-                OUTPUT=$(az vmss run-command invoke \
-                  --resource-group "${{ parameters.vmssResourceGroup }}" \
-                  --name "${{ parameters.vmssName }}" \
-                  --instance-id "${{ parameters.vmssInstanceId }}" \
+                if [ "${{ parameters.jumpboxType }}" = "vmss" ]; then
+                  RC_ARGS=(vmss run-command invoke \
+                    --resource-group "${{ parameters.vmssResourceGroup }}" \
+                    --name "${{ parameters.vmssName }}" \
+                    --instance-id "${{ parameters.vmssInstanceId }}")
+                else
+                  RC_ARGS=(vm run-command invoke \
+                    --resource-group "${{ parameters.vmssResourceGroup }}" \
+                    --name "${{ parameters.vmssName }}")
+                fi
+
+                OUTPUT=$(az "${RC_ARGS[@]}" \
                   --command-id RunShellScript \
                   --scripts "$REMOTE_SCRIPT" \
                   --output json)
@@ -81,10 +97,18 @@ stages:
               scriptType: bash
               scriptLocation: inlineScript
               inlineScript: |
-                OUTPUT=$(az vmss run-command invoke \
-                  --resource-group "${{ parameters.vmssResourceGroup }}" \
-                  --name "${{ parameters.vmssName }}" \
-                  --instance-id "${{ parameters.vmssInstanceId }}" \
+                if [ "${{ parameters.jumpboxType }}" = "vmss" ]; then
+                  RC_ARGS=(vmss run-command invoke \
+                    --resource-group "${{ parameters.vmssResourceGroup }}" \
+                    --name "${{ parameters.vmssName }}" \
+                    --instance-id "${{ parameters.vmssInstanceId }}")
+                else
+                  RC_ARGS=(vm run-command invoke \
+                    --resource-group "${{ parameters.vmssResourceGroup }}" \
+                    --name "${{ parameters.vmssName }}")
+                fi
+
+                OUTPUT=$(az "${RC_ARGS[@]}" \
                   --command-id RunShellScript \
                   --scripts "kubectl get pods,daemonsets \
                     -l app.kubernetes.io/name=netprobe \

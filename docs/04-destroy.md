@@ -86,9 +86,10 @@ tshark -r capture.pcap -z follow,tcp,ascii,0
 | Parameter | Required | Default | Description |
 |---|---|---|---|
 | `azureServiceConnection` | yes | — | ARM Service Connection name from step 1 of ADO setup |
-| `vmssName` | yes | — | Name of the jumpbox VMSS |
-| `vmssResourceGroup` | yes | — | Resource group of the jumpbox VMSS |
-| `vmssInstanceId` | no | `0` | VMSS instance ID to run commands on |
+| `jumpboxType` | no | `vmss` | `vmss` = Virtual Machine Scale Set · `vm` = plain VM |
+| `vmssName` | yes | — | Name of the jumpbox VM or VMSS |
+| `vmssResourceGroup` | yes | — | Resource group of the jumpbox |
+| `vmssInstanceId` | no | `0` | VMSS instance ID (ignored when `jumpboxType` is `vm`) |
 | `releaseName` | yes | — | The exact `releaseName` value used when the deploy pipeline was run |
 | `namespace` | no | `kube-system` | Must match the namespace used at deploy time |
 

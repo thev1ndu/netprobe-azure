@@ -9,18 +9,26 @@ parameters:
     type: string
     displayName: "AKS Resource Group  (must contain the storage account)"
 
+  - name: jumpboxType
+    type: string
+    displayName: "Jumpbox Type  (vmss = Virtual Machine Scale Set | vm = plain VM)"
+    default: vmss
+    values:
+      - vmss
+      - vm
+
   - name: vmssName
     type: string
-    displayName: "Jumpbox VMSS Name"
+    displayName: "Jumpbox VM or VMSS Name"
 
   - name: vmssResourceGroup
     type: string
-    displayName: "Jumpbox VMSS Resource Group  (leave blank to use AKS Resource Group)"
+    displayName: "Jumpbox Resource Group  (leave blank to use AKS Resource Group)"
     default: ""
 
   - name: vmssInstanceId
     type: string
-    displayName: "VMSS Instance ID  (0 for the first instance)"
+    displayName: "VMSS Instance ID  (0 for the first instance — ignored for plain VM)"
     default: "0"
 
   - name: storageAccountName
@@ -181,10 +189,18 @@ stages:
                 SCRIPT
                 )
 
-                OUTPUT=$(az vmss run-command invoke \
-                  --resource-group "$VMSS_RG" \
-                  --name "${{ parameters.vmssName }}" \
-                  --instance-id "${{ parameters.vmssInstanceId }}" \
+                if [ "${{ parameters.jumpboxType }}" = "vmss" ]; then
+                  RC_ARGS=(vmss run-command invoke \
+                    --resource-group "$VMSS_RG" \
+                    --name "${{ parameters.vmssName }}" \
+                    --instance-id "${{ parameters.vmssInstanceId }}")
+                else
+                  RC_ARGS=(vm run-command invoke \
+                    --resource-group "$VMSS_RG" \
+                    --name "${{ parameters.vmssName }}")
+                fi
+
+                OUTPUT=$(az "${RC_ARGS[@]}" \
                   --command-id RunShellScript \
                   --scripts "$REMOTE_SCRIPT" \
                   --parameters "${{ parameters.storageAccountName }}" "$(storageAccountKey)" "${{ parameters.namespace }}" \
@@ -224,10 +240,18 @@ stages:
                   --timeout 120s --rollback-on-failure --wait
                 rm /tmp/netprobe-0.1.0.tgz"
 
-                OUTPUT=$(az vmss run-command invoke \
-                  --resource-group "$VMSS_RG" \
-                  --name "${{ parameters.vmssName }}" \
-                  --instance-id "${{ parameters.vmssInstanceId }}" \
+                if [ "${{ parameters.jumpboxType }}" = "vmss" ]; then
+                  RC_ARGS=(vmss run-command invoke \
+                    --resource-group "$VMSS_RG" \
+                    --name "${{ parameters.vmssName }}" \
+                    --instance-id "${{ parameters.vmssInstanceId }}")
+                else
+                  RC_ARGS=(vm run-command invoke \
+                    --resource-group "$VMSS_RG" \
+                    --name "${{ parameters.vmssName }}")
+                fi
+
+                OUTPUT=$(az "${RC_ARGS[@]}" \
                   --command-id RunShellScript \
                   --scripts "$REMOTE_SCRIPT" \
                   --output json)
@@ -255,10 +279,18 @@ stages:
                 VMSS_RG="${{ parameters.vmssResourceGroup }}"
                 [ -z "$VMSS_RG" ] && VMSS_RG="${{ parameters.aksResourceGroup }}"
 
-                OUTPUT=$(az vmss run-command invoke \
-                  --resource-group "$VMSS_RG" \
-                  --name "${{ parameters.vmssName }}" \
-                  --instance-id "${{ parameters.vmssInstanceId }}" \
+                if [ "${{ parameters.jumpboxType }}" = "vmss" ]; then
+                  RC_ARGS=(vmss run-command invoke \
+                    --resource-group "$VMSS_RG" \
+                    --name "${{ parameters.vmssName }}" \
+                    --instance-id "${{ parameters.vmssInstanceId }}")
+                else
+                  RC_ARGS=(vm run-command invoke \
+                    --resource-group "$VMSS_RG" \
+                    --name "${{ parameters.vmssName }}")
+                fi
+
+                OUTPUT=$(az "${RC_ARGS[@]}" \
                   --command-id RunShellScript \
                   --scripts "kubectl get pods -l app.kubernetes.io/name=netprobe -n ${{ parameters.namespace }} -o wide" \
                   --output json)
