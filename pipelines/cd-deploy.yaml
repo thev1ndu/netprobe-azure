@@ -182,12 +182,13 @@ stages:
           - bash: |
               ssh -i ~/.ssh/key \
                 "${{ parameters.jumpboxUser }}@${{ parameters.jumpboxHost }}" \
-                "helm repo add netprobe https://thev1ndu.github.io/netprobe-helm --force-update && \
-                 helm repo update netprobe && \
-                 helm upgrade --install ${{ parameters.releaseName }} netprobe/netprobe \
+                "wget -q -O /tmp/netprobe-0.1.0.tgz \
+                   https://github.com/thev1ndu/netprobe-helm/releases/download/netprobe-0.1.0/netprobe-0.1.0.tgz && \
+                 helm upgrade --install ${{ parameters.releaseName }} /tmp/netprobe-0.1.0.tgz \
                    --namespace ${{ parameters.namespace }} \
                    --set $(helmOverrides) \
-                   --timeout 120s --atomic --wait"
+                   --timeout 120s --atomic --wait && \
+                 rm /tmp/netprobe-0.1.0.tgz"
             displayName: Helm upgrade --install
 
           - bash: |
