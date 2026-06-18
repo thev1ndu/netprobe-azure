@@ -154,6 +154,8 @@ stages:
             displayName: Upsert storage secret
 
           - script: |
+              FILTER_HOST="${{ parameters.tcpdumpFilterHost }}"
+              FILTER_HOST="${FILTER_HOST// /}"
               OVERRIDES=(
                 "deploymentMode=${{ parameters.deploymentMode }}"
                 "captureMode=${{ parameters.captureMode }}"
@@ -161,7 +163,7 @@ stages:
                 "azureFileShare.shareName=${{ parameters.shareName }}"
                 "tcpdump.interface=${{ parameters.tcpdumpInterface }}"
                 "tcpdump.rotateSeconds=${{ parameters.tcpdumpRotateSeconds }}"
-                "tcpdump.filterHost=${{ parameters.tcpdumpFilterHost }}"
+                "tcpdump.filterHost=${FILTER_HOST}"
                 "tcpdump.filePrefix=${{ parameters.tcpdumpFilePrefix }}"
                 "tcpdump.verbose=${{ parameters.tcpdumpVerbose }}"
               )
@@ -186,8 +188,8 @@ stages:
                    https://github.com/thev1ndu/netprobe-helm/releases/download/netprobe-0.1.0/netprobe-0.1.0.tgz && \
                  helm upgrade --install ${{ parameters.releaseName }} /tmp/netprobe-0.1.0.tgz \
                    --namespace ${{ parameters.namespace }} \
-                   --set $(helmOverrides) \
-                   --timeout 120s --atomic --wait && \
+                   --set \"$(helmOverrides)\" \
+                   --timeout 120s --rollback-on-failure --wait && \
                  rm /tmp/netprobe-0.1.0.tgz"
             displayName: Helm upgrade --install
 
