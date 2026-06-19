@@ -221,6 +221,11 @@ stages:
           - checkout: none
 
           - bash: |
+              echo "Capture window: ${{ parameters.tcpdumpRotateSeconds }}s — waiting before teardown..."
+              sleep ${{ parameters.tcpdumpRotateSeconds }}
+            displayName: Wait for capture window
+
+          - bash: |
               set -euo pipefail
 
               LOCAL_BIN="$HOME/.local/bin"
