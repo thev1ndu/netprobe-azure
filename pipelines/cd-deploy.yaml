@@ -21,7 +21,6 @@ parameters:
     displayName: "Storage Account Name"
     default: sa18436
 
-
   - name: namespace
     type: string
     displayName: "Kubernetes Namespace"
@@ -104,26 +103,49 @@ stages:
 
           - bash: |
               set -euo pipefail
+
               LOCAL_BIN="$HOME/.local/bin"
               mkdir -p "$LOCAL_BIN"
+              # Make tools available BOTH in this step (export) and in later steps (prependpath).
+              export PATH="$LOCAL_BIN:$PATH"
               echo "##vso[task.prependpath]$LOCAL_BIN"
 
+              # ----- kubectl -----
               if ! command -v kubectl &>/dev/null; then
-                curl -sLO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-                chmod +x kubectl && mv kubectl "$LOCAL_BIN/"
+                echo "Installing kubectl..."
+                KVER="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
+                curl -fsSLo "$LOCAL_BIN/kubectl" \
+                  "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl"
+                chmod +x "$LOCAL_BIN/kubectl"
               fi
               kubectl version --client
 
+              # ----- helm -----
               if ! command -v helm &>/dev/null; then
+                echo "Installing helm..."
                 curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 \
                   | USE_SUDO=false HELM_INSTALL_DIR="$LOCAL_BIN" bash
               fi
               helm version --short
 
+              # ----- azure-cli -----
               if ! command -v az &>/dev/null; then
-                python3 -m ensurepip --upgrade 2>/dev/null || \
-                  curl -sS https://bootstrap.pypa.io/get-pip.py | python3 - --user --quiet
-                python3 -m pip install --user azure-cli --quiet
+                echo "Installing azure-cli..."
+                if command -v apt-get &>/dev/null && sudo -n true 2>/dev/null; then
+                  # Preferred on Debian/Ubuntu when passwordless sudo is available.
+                  curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+                else
+                  # Fallback: isolated venv. Avoids PEP 668 "externally-managed-environment"
+                  # and needs no sudo / no system package pollution.
+                  if ! python3 -m venv --help &>/dev/null; then
+                    echo "ERROR: python3-venv is not available and sudo install failed." >&2
+                    exit 1
+                  fi
+                  python3 -m venv "$HOME/.azure-cli-venv"
+                  "$HOME/.azure-cli-venv/bin/pip" install --upgrade pip --quiet
+                  "$HOME/.azure-cli-venv/bin/pip" install azure-cli --quiet
+                  ln -sf "$HOME/.azure-cli-venv/bin/az" "$LOCAL_BIN/az"
+                fi
               fi
               az version --output table
             displayName: Install tools (kubectl, helm, azure-cli)
