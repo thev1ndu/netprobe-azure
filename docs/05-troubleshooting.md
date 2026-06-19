@@ -2,6 +2,46 @@
 
 ---
 
+## VMSS run-command blocked (`OperationNotAllowed`)
+
+```
+Operation 'VMScaleSetVMs.RunCommand.POST' is not allowed on Virtual Machine Scale Set 'is-vmss'.
+```
+
+**Cause:** The VMSS was created in **Flexible orchestration mode** (the Azure CLI default). `az vmss run-command invoke` only works with **Uniform** mode.
+
+**Option 1 — Use the existing Flexible VMSS via its instance VM ID:**
+
+```bash
+INSTANCE_VM_ID=$(az vmss list-instances \
+  --resource-group <rg> \
+  --name <vmss-name> \
+  --query "[0].id" -o tsv)
+
+az vm run-command invoke \
+  --ids "$INSTANCE_VM_ID" \
+  --command-id RunShellScript \
+  --scripts "kubectl cluster-info"
+```
+
+Set `jumpboxType: vm` in the pipelines and pass `$INSTANCE_VM_ID` (or the instance name) as `vmssName`. This works without recreating the VMSS.
+
+**Option 2 — Recreate the VMSS in Uniform mode:**
+
+```bash
+az vmss delete --resource-group <rg> --name <vmss-name>
+
+az vmss create \
+  --resource-group <rg> \
+  --name jumpbox-vmss \
+  --orchestration-mode Uniform \
+  ...
+```
+
+Then `az vmss run-command invoke` works as expected.
+
+---
+
 ## Deploy pipeline failures
 
 | Symptom | Likely cause | Fix |

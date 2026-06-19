@@ -8,54 +8,49 @@ Configure the ADO project once per cluster. After this, day-to-day use is just r
 
 - [01-azure-infra.md](01-azure-infra.md) completed
 - ADO project with access to the repo containing this pipeline
-- The jumpbox is a VMSS (Virtual Machine Scale Set) instance reachable from the AKS cluster
 
 ---
 
-## 1. Create the Azure Resource Manager Service Connection
+## 1. Store the storage account key as a pipeline secret variable
 
-The pipelines use an ARM Service Connection to authenticate to Azure — to fetch the
-storage account key automatically and to issue `az vmss run-command invoke` calls against
-the jumpbox. No SSH key or public IP is required.
+The deploy pipeline reads the storage account key from a secret pipeline variable —
+no ARM Service Connection required.
+
+```bash
+# Fetch the key once and paste it into ADO
+az storage account keys list \
+  --resource-group rg-thevindu \
+  --account-name sa18436 \
+  --query "[0].value" -o tsv
+```
+
+In ADO:
+
+1. Open **NetProbe — CD Deploy** pipeline → **Edit → Variables**
+2. Add variable name: `storageAccountKey`
+3. Paste the key value
+4. Check **Keep this value secret** → **Save**
+
+The pipeline references it as `$(storageAccountKey)` — masked in all logs.
+
+---
+
+## 2. Create the Kubernetes Service Connection
+
+The pipelines use a Kubernetes Service Connection to run `helm` and `kubectl` commands
+directly via native ADO tasks — no jumpbox, no SSH, no run-command required.
+
+> **Private cluster note:** ADO Microsoft-hosted agents cannot reach `privatelink.eastus2.azmk8s.io`
+> from outside the VNet. The Kubernetes SC works because the jumphost is configured as a
+> self-hosted ADO agent inside the VNet. See [AKS-SC.md](../../AKS-SC.md) for the full setup.
 
 1. Go to **Project Settings → Service connections → New service connection**
-2. Select **Azure Resource Manager**
-3. Choose **Service principal (automatic)** as the authentication method
-4. Set **Scope level** to **Resource Group**
-5. Select your subscription and the resource group that contains the AKS cluster, storage account, and VMSS jumpbox
-6. Name it: `sc-arm-<resourcegroup>`
+2. Select **Kubernetes**
+3. Authentication method: **Azure Subscription**
+4. Select subscription, resource group `rg-thevindu`, cluster `aks-wso2is`
+5. Namespace: `kube-system`
+6. Name it: `rnd-aks-thevindu`
 7. Check **Grant access permission to all pipelines** → **Save**
-
-> If the VMSS jumpbox is in a different resource group from the AKS cluster, scope the
-> service connection to the subscription level (or create a second connection scoped to
-> the VMSS resource group).
-
-> The exact name you give this connection is what you enter in the `azureServiceConnection`
-> parameter each time you trigger either pipeline.
-
----
-
-## 2. Verify VMSS run-command permission
-
-The service principal created above needs **Contributor** (or at minimum the built-in
-**Virtual Machine Contributor**) role on the VMSS resource to invoke run-commands.
-
-```bash
-# Check the service principal's role on the VMSS
-SP_ID=$(az ad sp list --display-name "sc-arm-<resourcegroup>" --query "[0].appId" -o tsv)
-VMSS_ID=$(az vmss show --resource-group <vmss-rg> --name <vmss-name> --query id -o tsv)
-
-az role assignment list --assignee "$SP_ID" --scope "$VMSS_ID" --query "[].roleDefinitionName" -o tsv
-```
-
-If missing, assign the role:
-
-```bash
-az role assignment create \
-  --assignee "$SP_ID" \
-  --role "Virtual Machine Contributor" \
-  --scope "$VMSS_ID"
-```
 
 ---
 
@@ -85,8 +80,8 @@ az role assignment create \
 
 After this document you have:
 
-- [ ] ARM Service Connection `sc-arm-<resourcegroup>` created and scoped to the resource group
-- [ ] Service principal has `Virtual Machine Contributor` (or `Contributor`) on the VMSS
+- [ ] `storageAccountKey` secret variable set on the CD Deploy pipeline
+- [ ] Kubernetes Service Connection `rnd-aks-thevindu` created
 - [ ] `NetProbe — CD Deploy` pipeline registered
 - [ ] `NetProbe — CD Destroy` pipeline registered
 

@@ -9,7 +9,7 @@ NetProbe pod or DaemonSet. The capture begins immediately on container start.
 
 - [02-ado-setup.md](02-ado-setup.md) completed
 - Image pushed to ACR (see [aks-node-tcpdump CI](https://github.com/thev1ndu/aks-node-tcpdump))
-- Jumpbox VMSS instance has outbound HTTPS to `thev1ndu.github.io` (helm chart is pulled from there at deploy time)
+- ADO agent (jumphost `aks-jumphost`) is online — check **Project Settings → Agent pools → Default**
 
 ---
 
@@ -20,7 +20,7 @@ NetProbe pod or DaemonSet. The capture begins immediately on container start.
 | Storage account **name** | You enter it as the `storageAccountName` parameter at run time |
 | Storage account **key** | Pipeline fetches it automatically via `az storage account keys list` using the ARM service connection — you never paste the key anywhere |
 
-The key is passed to the VMSS run-command via `--parameters` and is masked in all ADO pipeline logs.
+The key is injected into the `azure-storage-account-credentials-secret` Kubernetes secret on each run and is masked in all pipeline logs.
 
 ---
 
@@ -31,11 +31,10 @@ The key is passed to the VMSS run-command via `--parameters` and is masked in al
 3. Click **Run**
 
 The pipeline will:
-1. Fetch the storage account key via the ARM service connection
-2. Upsert the `azure-storage-account-credentials-secret` in the target namespace (via `az vmss run-command invoke` on the jumpbox)
-3. Pull the `netprobe` helm chart from `https://thev1ndu.github.io/netprobe-helm` on the jumpbox
-4. Run `helm upgrade --install` on the jumpbox with the parameters you provided
-5. Print pod status once Helm reports success
+1. Apply the `azure-storage-account-credentials-secret` to the cluster using `$(storageAccountKey)` (secret pipeline variable set in ADO)
+2. Download the `netprobe` Helm chart from GitHub releases
+3. Run `helm upgrade --install` with the parameters you provided
+4. Print pod status once Helm reports success
 
 ---
 
@@ -43,19 +42,14 @@ The pipeline will:
 
 | Parameter | Required | Default | Description |
 |---|---|---|---|
-| `azureServiceConnection` | yes | — | ARM Service Connection name from step 1 of ADO setup |
-| `aksResourceGroup` | yes | — | Azure resource group containing the AKS cluster and storage account |
-| `jumpboxType` | no | `vmss` | `vmss` = Virtual Machine Scale Set · `vm` = plain VM |
-| `vmssName` | yes | — | Name of the jumpbox VM or VMSS |
-| `vmssResourceGroup` | no | _(uses `aksResourceGroup`)_ | Resource group of the jumpbox — leave blank if same as `aksResourceGroup` |
-| `vmssInstanceId` | no | `0` | VMSS instance ID (ignored when `jumpboxType` is `vm`) |
-| `storageAccountName` | yes | — | Azure Storage Account name; key is fetched automatically via the ARM service connection |
+| `kubernetesServiceConnection` | no | `rnd-aks-thevindu` | Kubernetes Service Connection name |
+| `storageAccountName` | yes | — | Azure Storage Account name (`sa18436`) |
 | `namespace` | no | `kube-system` | Kubernetes namespace to deploy into |
 | `deploymentMode` | no | `pod` | `pod` = pin to one node · `daemonset` = all nodes |
 | `captureMode` | no | `tcpdump` | `tcpdump` = auto-start capture · `shell` = idle, use `kubectl exec` |
-| `releaseName` | no | `netprobe` | Helm release name — also used as the pod name in pod mode |
 | `nodeName` | no | _(blank)_ | AKS node name to pin to in pod mode; blank lets the scheduler pick |
-| `imageDigest` | no | _(blank)_ | `sha256:...` digest to override the value baked into `values.yaml` |
+| `imageRegistry` | no | _(blank)_ | ACR login server (e.g. `acrrrrrrrr.azurecr.io`) — overrides the chart default |
+| `imageDigest` | no | _(blank)_ | `sha256:...` digest — overrides the value baked into `values.yaml` |
 | `shareName` | no | `fileshare` | Azure File Share name |
 | `tcpdumpInterface` | no | `any` | Network interface to capture on (`any` \| `eth0`) |
 | `tcpdumpRotateSeconds` | no | `300` | Rotate the `.pcap` output file every N seconds |
@@ -70,10 +64,7 @@ The pipeline will:
 ### Capture all traffic on a specific node
 
 ```
-azureServiceConnection: sc-arm-<resourcegroup>
-aksResourceGroup:      <your-resource-group>
-vmssName:              <your-jumpbox-vmss-name>
-storageAccountName:    <your-storage-account>
+storageAccountName:    sa18436
 deploymentMode:        pod
 releaseName:           debug-node-1
 nodeName:              aks-aksnpuser-72792323-vmss00001m
@@ -83,10 +74,7 @@ tcpdumpRotateSeconds:  300
 ### Capture traffic to a specific host
 
 ```
-azureServiceConnection: sc-arm-<resourcegroup>
-aksResourceGroup:      <your-resource-group>
-vmssName:              <your-jumpbox-vmss-name>
-storageAccountName:    <your-storage-account>
+storageAccountName:    sa18436
 deploymentMode:        pod
 releaseName:           debug-apigw
 nodeName:              aks-aksnpuser-72792323-vmss00001m
@@ -98,10 +86,7 @@ tcpdumpRotateSeconds:  300
 ### Capture across all nodes simultaneously (DaemonSet)
 
 ```
-azureServiceConnection: sc-arm-<resourcegroup>
-aksResourceGroup:      <your-resource-group>
-vmssName:              <your-jumpbox-vmss-name>
-storageAccountName:    <your-storage-account>
+storageAccountName:    sa18436
 deploymentMode:        daemonset
 releaseName:           netprobe-all-nodes
 tcpdumpRotateSeconds:  300
@@ -113,16 +98,13 @@ overwrite each other on the share.
 ### Interactive shell — exec in to run tools manually
 
 ```
-azureServiceConnection: sc-arm-<resourcegroup>
-aksResourceGroup:      <your-resource-group>
-vmssName:              <your-jumpbox-vmss-name>
-storageAccountName:    <your-storage-account>
+storageAccountName:    sa18436
 captureMode:           shell
 releaseName:           debug-shell
 nodeName:              aks-aksnpuser-72792323-vmss00001m
 ```
 
-Then from the jumpbox (connect via Azure Bastion or serial console):
+Then exec into the pod (from the jumphost or any machine with kubectl access):
 
 ```bash
 kubectl exec -it debug-shell -n kube-system -- /bin/bash
@@ -137,18 +119,9 @@ mtr --report apigw.example.com                   # path trace with latency
 tshark -r /mnt/fileshare/dumps/capture.pcap      # inspect existing .pcap on share
 ```
 
-### Deploy a newly published image by digest
-
-```
-releaseName:   netprobe
-imageDigest:   sha256:<new-digest-from-CI>
-```
-
 ---
 
 ## Post-deploy checks
-
-Run these by invoking a run-command on the jumpbox, or connect to it via Azure Bastion:
 
 ```bash
 # Stream tcpdump output — pod mode
@@ -162,21 +135,10 @@ kubectl get pod <releaseName> -n kube-system -o wide
 
 # Confirm .pcap files are appearing on the share
 az storage file list \
-  --account-name <your-storage-account> \
+  --account-name sa18436 \
   --share-name fileshare \
   --path dumps \
   --output table
-```
-
-Or issue a one-off run-command from the ADO agent / your local machine (requires ARM credentials):
-
-```bash
-az vmss run-command invoke \
-  --resource-group <vmss-rg> \
-  --name <vmss-name> \
-  --instance-id 0 \
-  --command-id RunShellScript \
-  --scripts "kubectl logs -f <releaseName> -n kube-system"
 ```
 
 ---

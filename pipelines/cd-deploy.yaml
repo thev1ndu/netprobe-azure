@@ -1,35 +1,10 @@
 trigger: none
 
 parameters:
-  - name: azureServiceConnection
+  - name: kubernetesServiceConnection
     type: string
-    displayName: "Azure Resource Manager Service Connection"
-
-  - name: aksResourceGroup
-    type: string
-    displayName: "AKS Resource Group  (must contain the storage account)"
-
-  - name: jumpboxType
-    type: string
-    displayName: "Jumpbox Type  (vmss = Virtual Machine Scale Set | vm = plain VM)"
-    default: vmss
-    values:
-      - vmss
-      - vm
-
-  - name: vmssName
-    type: string
-    displayName: "Jumpbox VM or VMSS Name"
-
-  - name: vmssResourceGroup
-    type: string
-    displayName: "Jumpbox Resource Group  (leave blank to use AKS Resource Group)"
-    default: ""
-
-  - name: vmssInstanceId
-    type: string
-    displayName: "VMSS Instance ID  (0 for the first instance — ignored for plain VM)"
-    default: "0"
+    displayName: "Kubernetes Service Connection"
+    default: rnd-aks-thevindu
 
   - name: storageAccountName
     type: string
@@ -56,11 +31,6 @@ parameters:
       - tcpdump
       - shell
 
-  - name: releaseName
-    type: string
-    displayName: "Helm Release Name  (also used as the Pod name in pod mode)"
-    default: netprobe
-
   - name: nodeName
     type: string
     displayName: "Target Node Name  (pod mode only — leave blank to let scheduler pick)"
@@ -68,7 +38,7 @@ parameters:
 
   - name: imageRegistry
     type: string
-    displayName: "Container Registry  (e.g. myacr.azurecr.io)"
+    displayName: "Container Registry  (e.g. acrrrrrrrr.azurecr.io)"
     default: ""
 
   - name: imageDigest
@@ -120,18 +90,29 @@ stages:
         steps:
           - checkout: none
 
-          - task: AzureCLI@2
-            displayName: Fetch storage account key
+          - bash: |
+              cat > "$(Agent.TempDirectory)/storage-secret.yaml" <<EOF
+              apiVersion: v1
+              kind: Secret
+              metadata:
+                name: azure-storage-account-credentials-secret
+                namespace: ${{ parameters.namespace }}
+              type: Opaque
+              stringData:
+                azurestorageaccountname: "${{ parameters.storageAccountName }}"
+                azurestorageaccountkey: "$(storageAccountKey)"
+              EOF
+            displayName: Generate storage secret manifest
+
+          - task: Kubernetes@1
+            displayName: Upsert storage secret
             inputs:
-              azureSubscription: ${{ parameters.azureServiceConnection }}
-              scriptType: bash
-              scriptLocation: inlineScript
-              inlineScript: |
-                KEY=$(az storage account keys list \
-                  --resource-group "${{ parameters.aksResourceGroup }}" \
-                  --account-name "${{ parameters.storageAccountName }}" \
-                  --query "[0].value" -o tsv)
-                echo "##vso[task.setvariable variable=storageAccountKey;issecret=true]$KEY"
+              connectionType: Kubernetes Service Connection
+              kubernetesServiceEndpoint: ${{ parameters.kubernetesServiceConnection }}
+              namespace: ${{ parameters.namespace }}
+              command: apply
+              useConfigurationFile: true
+              configuration: $(Agent.TempDirectory)/storage-secret.yaml
 
           - script: |
               FILTER_HOST="${{ parameters.tcpdumpFilterHost }}"
@@ -139,7 +120,7 @@ stages:
               OVERRIDES=(
                 "deploymentMode=${{ parameters.deploymentMode }}"
                 "captureMode=${{ parameters.captureMode }}"
-                "pod.name=${{ parameters.releaseName }}"
+                "pod.name=netprobe"
                 "azureFileShare.shareName=${{ parameters.shareName }}"
                 "tcpdump.interface=${{ parameters.tcpdumpInterface }}"
                 "tcpdump.rotateSeconds=${{ parameters.tcpdumpRotateSeconds }}"
@@ -165,138 +146,31 @@ stages:
               echo "Helm overrides: $OVERRIDE_STR"
             displayName: Build helm overrides
 
-          - task: AzureCLI@2
-            displayName: Upsert storage secret
-            inputs:
-              azureSubscription: ${{ parameters.azureServiceConnection }}
-              scriptType: bash
-              scriptLocation: inlineScript
-              inlineScript: |
-                VMSS_RG="${{ parameters.vmssResourceGroup }}"
-                [ -z "$VMSS_RG" ] && VMSS_RG="${{ parameters.aksResourceGroup }}"
+          - bash: |
+              wget -q -O "$(Agent.TempDirectory)/netprobe.tgz" \
+                https://github.com/thev1ndu/netprobe-helm/releases/download/netprobe-0.1.0/netprobe-0.1.0.tgz
+            displayName: Download Helm chart
 
-                REMOTE_SCRIPT=$(cat <<'SCRIPT'
-                trap 'echo "##exit:$?"' EXIT
-                set -euo pipefail
-                SANAME="$1"
-                SAKEY="$2"
-                NS="$3"
-                kubectl create secret generic azure-storage-account-credentials-secret \
-                  --namespace "$NS" \
-                  --from-literal=azurestorageaccountname="$SANAME" \
-                  --from-literal=azurestorageaccountkey="$SAKEY" \
-                  --dry-run=client -o yaml | kubectl apply -f -
-                SCRIPT
-                )
-
-                if [ "${{ parameters.jumpboxType }}" = "vmss" ]; then
-                  RC_ARGS=(vmss run-command invoke \
-                    --resource-group "$VMSS_RG" \
-                    --name "${{ parameters.vmssName }}" \
-                    --instance-id "${{ parameters.vmssInstanceId }}")
-                else
-                  RC_ARGS=(vm run-command invoke \
-                    --resource-group "$VMSS_RG" \
-                    --name "${{ parameters.vmssName }}")
-                fi
-
-                OUTPUT=$(az "${RC_ARGS[@]}" \
-                  --command-id RunShellScript \
-                  --scripts "$REMOTE_SCRIPT" \
-                  --parameters "${{ parameters.storageAccountName }}" "$(storageAccountKey)" "${{ parameters.namespace }}" \
-                  --output json)
-
-                echo "$OUTPUT" | python3 -c "
-                import sys, json
-                data = json.load(sys.stdin)
-                msg = data['value'][0]['message']
-                print(msg)
-                exit_code = 0
-                for line in msg.split('\n'):
-                    if '##exit:' in line:
-                        try: exit_code = int(line.split('##exit:')[1].strip())
-                        except: pass
-                sys.exit(exit_code)
-                "
-
-          - task: AzureCLI@2
+          - task: HelmDeploy@0
             displayName: Helm upgrade --install
             inputs:
-              azureSubscription: ${{ parameters.azureServiceConnection }}
-              scriptType: bash
-              scriptLocation: inlineScript
-              inlineScript: |
-                VMSS_RG="${{ parameters.vmssResourceGroup }}"
-                [ -z "$VMSS_RG" ] && VMSS_RG="${{ parameters.aksResourceGroup }}"
+              connectionType: Kubernetes Service Connection
+              kubernetesServiceEndpoint: ${{ parameters.kubernetesServiceConnection }}
+              namespace: ${{ parameters.namespace }}
+              command: upgrade
+              chartType: FilePath
+              chartPath: $(Agent.TempDirectory)/netprobe.tgz
+              releaseName: netprobe
+              install: true
+              overrideValues: $(helmOverrides)
+              waitForExecution: true
+              arguments: --timeout 120s --atomic
 
-                CHART_URL="https://github.com/thev1ndu/netprobe-helm/releases/download/netprobe-0.1.0/netprobe-0.1.0.tgz"
-
-                REMOTE_SCRIPT="trap 'echo ##exit:\$?' EXIT
-                set -euo pipefail
-                wget -q -O /tmp/netprobe-0.1.0.tgz \"${CHART_URL}\"
-                helm upgrade --install \"${{ parameters.releaseName }}\" /tmp/netprobe-0.1.0.tgz \
-                  --namespace \"${{ parameters.namespace }}\" \
-                  --set \"$(helmOverrides)\" \
-                  --timeout 120s --rollback-on-failure --wait
-                rm /tmp/netprobe-0.1.0.tgz"
-
-                if [ "${{ parameters.jumpboxType }}" = "vmss" ]; then
-                  RC_ARGS=(vmss run-command invoke \
-                    --resource-group "$VMSS_RG" \
-                    --name "${{ parameters.vmssName }}" \
-                    --instance-id "${{ parameters.vmssInstanceId }}")
-                else
-                  RC_ARGS=(vm run-command invoke \
-                    --resource-group "$VMSS_RG" \
-                    --name "${{ parameters.vmssName }}")
-                fi
-
-                OUTPUT=$(az "${RC_ARGS[@]}" \
-                  --command-id RunShellScript \
-                  --scripts "$REMOTE_SCRIPT" \
-                  --output json)
-
-                echo "$OUTPUT" | python3 -c "
-                import sys, json
-                data = json.load(sys.stdin)
-                msg = data['value'][0]['message']
-                print(msg)
-                exit_code = 0
-                for line in msg.split('\n'):
-                    if '##exit:' in line:
-                        try: exit_code = int(line.split('##exit:')[1].strip())
-                        except: pass
-                sys.exit(exit_code)
-                "
-
-          - task: AzureCLI@2
+          - task: Kubernetes@1
             displayName: Show pod status
             inputs:
-              azureSubscription: ${{ parameters.azureServiceConnection }}
-              scriptType: bash
-              scriptLocation: inlineScript
-              inlineScript: |
-                VMSS_RG="${{ parameters.vmssResourceGroup }}"
-                [ -z "$VMSS_RG" ] && VMSS_RG="${{ parameters.aksResourceGroup }}"
-
-                if [ "${{ parameters.jumpboxType }}" = "vmss" ]; then
-                  RC_ARGS=(vmss run-command invoke \
-                    --resource-group "$VMSS_RG" \
-                    --name "${{ parameters.vmssName }}" \
-                    --instance-id "${{ parameters.vmssInstanceId }}")
-                else
-                  RC_ARGS=(vm run-command invoke \
-                    --resource-group "$VMSS_RG" \
-                    --name "${{ parameters.vmssName }}")
-                fi
-
-                OUTPUT=$(az "${RC_ARGS[@]}" \
-                  --command-id RunShellScript \
-                  --scripts "kubectl get pods -l app.kubernetes.io/name=netprobe -n ${{ parameters.namespace }} -o wide" \
-                  --output json)
-
-                echo "$OUTPUT" | python3 -c "
-                import sys, json
-                data = json.load(sys.stdin)
-                print(data['value'][0]['message'])
-                "
+              connectionType: Kubernetes Service Connection
+              kubernetesServiceEndpoint: ${{ parameters.kubernetesServiceConnection }}
+              namespace: ${{ parameters.namespace }}
+              command: get
+              arguments: pods -l app.kubernetes.io/name=netprobe -o wide

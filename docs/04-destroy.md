@@ -13,15 +13,10 @@ persist until you remove them manually.
 - The deploy pipeline has been run at least once
 - You know the exact `releaseName` used at deploy time
 
-  If you are not sure, check running releases via run-command:
+  If you are not sure, check running releases:
 
   ```bash
-  az vmss run-command invoke \
-    --resource-group <vmss-rg> \
-    --name <vmss-name> \
-    --instance-id 0 \
-    --command-id RunShellScript \
-    --scripts "helm list -n kube-system | grep netprobe"
+  helm list -n kube-system | grep netprobe
   ```
 
 ---
@@ -34,7 +29,7 @@ Do this before or after running destroy — the files are on the share either wa
 
 ```bash
 az storage file download-batch \
-  --account-name <your-storage-account> \
+  --account-name sa18436 \
   --source "fileshare/dumps" \
   --destination ./captures \
   --pattern "*.pcap"
@@ -44,7 +39,7 @@ az storage file download-batch \
 
 ```bash
 az storage file list \
-  --account-name <your-storage-account> \
+  --account-name sa18436 \
   --share-name fileshare \
   --path dumps \
   --query "[].name" \
@@ -55,7 +50,7 @@ az storage file list \
 
 ```bash
 az storage file download \
-  --account-name <your-storage-account> \
+  --account-name sa18436 \
   --share-name fileshare \
   --path dumps/<filename>.pcap \
   --dest ./<filename>.pcap
@@ -85,12 +80,7 @@ tshark -r capture.pcap -z follow,tcp,ascii,0
 
 | Parameter | Required | Default | Description |
 |---|---|---|---|
-| `azureServiceConnection` | yes | — | ARM Service Connection name from step 1 of ADO setup |
-| `jumpboxType` | no | `vmss` | `vmss` = Virtual Machine Scale Set · `vm` = plain VM |
-| `vmssName` | yes | — | Name of the jumpbox VM or VMSS |
-| `vmssResourceGroup` | yes | — | Resource group of the jumpbox |
-| `vmssInstanceId` | no | `0` | VMSS instance ID (ignored when `jumpboxType` is `vm`) |
-| `releaseName` | yes | — | The exact `releaseName` value used when the deploy pipeline was run |
+| `kubernetesServiceConnection` | no | `rnd-aks-thevindu` | Kubernetes Service Connection name |
 | `namespace` | no | `kube-system` | Must match the namespace used at deploy time |
 
 > `releaseName` must match exactly. A mismatch causes `helm uninstall` to target a
@@ -100,15 +90,12 @@ tshark -r capture.pcap -z follow,tcp,ascii,0
 
 ## 3. Verify cleanup
 
-After the pipeline succeeds, confirm via run-command:
-
 ```bash
-az vmss run-command invoke \
-  --resource-group <vmss-rg> \
-  --name <vmss-name> \
-  --instance-id 0 \
-  --command-id RunShellScript \
-  --scripts "kubectl get pods -l app.kubernetes.io/name=netprobe -n kube-system; helm list -n kube-system | grep netprobe"
+# Should return nothing
+kubectl get pods -l app.kubernetes.io/name=netprobe -n kube-system
+
+# Should show no releases
+helm list -n kube-system | grep netprobe
 ```
 
 DaemonSet pods terminate on each node independently — if pods linger briefly, wait
@@ -121,9 +108,8 @@ DaemonSet pods terminate on each node independently — if pods linger briefly, 
 The `.pcap` files persist on the share indefinitely. Delete them when no longer needed:
 
 ```bash
-# Delete all files under dumps/
 az storage file delete-batch \
-  --account-name <your-storage-account> \
+  --account-name sa18436 \
   --source "fileshare/dumps"
 ```
 

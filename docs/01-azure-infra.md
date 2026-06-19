@@ -160,12 +160,50 @@ Jumpbox VMSS (any subnet in the VNet)
 
 The `az vmss run-command invoke` call itself goes through the Azure control plane (ARM API) and has no VNet requirements — the ADO Microsoft-hosted agent sends commands to the VMSS via `management.azure.com` regardless of network topology.
 
+### Create the VMSS
+
+Tool installation (kubectl, helm, Azure CLI) is handled at boot by `cloud-init.yaml` — no manual install step needed.
+
+```bash
+az vmss create \
+  --resource-group $RG \
+  --name is-vmss \
+  --orchestration-mode Uniform \
+  --image Ubuntu2204 \
+  --vm-sku Standard_B2s \
+  --instance-count 1 \
+  --vnet-name $VNET \
+  --subnet $JUMP_SUBNET \
+  --admin-username azureuser \
+  --authentication-type ssh \
+  --generate-ssh-keys \
+  --custom-data cloud-init.yaml \
+  --public-ip-address "" \
+  --load-balancer ""
+```
+
+> `--orchestration-mode Uniform` is required — Flexible mode (the Azure CLI default) blocks `az vmss run-command invoke`.
+
+Wait ~2 minutes for cloud-init to finish, then configure kubeconfig:
+
+```bash
+az vmss run-command invoke \
+  --resource-group $RG \
+  --name is-vmss \
+  --instance-id 0 \
+  --command-id RunShellScript \
+  --scripts "
+    az login --identity
+    az aks get-credentials --resource-group $RG --name $AKS_NAME --overwrite-existing
+  "
+```
+
 ### Verify the jumpbox can reach the AKS API server
 
 ```bash
 az vmss run-command invoke \
-  --resource-group <vmss-rg> \
-  --name <vmss-name> \
+  --resource-group $RG \
+  --name is-vmss \
   --instance-id 0 \
   --command-id RunShellScript \
   --scripts "kubectl cluster-info"
