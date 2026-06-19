@@ -107,7 +107,7 @@ stages:
       - job: DeployNetProbe
         displayName: helm upgrade --install netprobe
         pool:
-          vmImage: ubuntu-latest
+          name: rnd-thevindu-vmss
         steps:
           - checkout: none
 

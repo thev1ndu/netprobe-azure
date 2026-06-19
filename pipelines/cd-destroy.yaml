@@ -38,7 +38,7 @@ stages:
       - job: DestroyNetProbe
         displayName: helm uninstall netprobe
         pool:
-          vmImage: ubuntu-latest
+          name: rnd-thevindu-vmss
         steps:
           - checkout: none
 
