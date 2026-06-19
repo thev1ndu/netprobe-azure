@@ -55,7 +55,7 @@ stages:
             continueOnError: true
             inputs:
               connectionType: 'Kubernetes Service Connection'
-              kubernetesServiceConnection: $(AZURE_SERVICE_CONNECTION)
+              kubernetesServiceConnection: $(AKS_SERVICE_CONNECTION)
               namespace: ${{ parameters.namespace }}
               command: uninstall
               arguments: netprobe
@@ -64,7 +64,7 @@ stages:
             displayName: Confirm resources removed
             inputs:
               connectionType: 'Kubernetes Service Connection'
-              kubernetesServiceEndpoint: $(AZURE_SERVICE_CONNECTION)
+              kubernetesServiceEndpoint: $(AKS_SERVICE_CONNECTION)
               namespace: ${{ parameters.namespace }}
               command: get
               arguments: 'pods,daemonsets -l app.kubernetes.io/name=netprobe --ignore-not-found'
