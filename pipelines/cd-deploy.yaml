@@ -235,7 +235,7 @@ stages:
               chartPath: $(Agent.TempDirectory)/netprobe.tgz
               releaseName: netprobe
               overrideValues: $(helmOverrides)
-              arguments: '--timeout 120s --atomic --create-namespace'
+              arguments: '--timeout 300s --atomic --create-namespace'
 
           - task: Kubernetes@1
             displayName: Show pod status
