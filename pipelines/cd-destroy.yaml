@@ -4,27 +4,7 @@ parameters:
   - name: aksServiceConnection
     type: string
     displayName: "AKS Service Connection"
-    default: thevindu-aks-sc
-
-  - name: azureServiceConnection
-    type: string
-    displayName: "Azure Resource Manager Service Connection"
-    default: thevindu-rnd-sc
-
-  - name: vmssResourceGroup
-    type: string
-    displayName: "VMSS Resource Group"
-    default: rg-thevindu
-
-  - name: vmssName
-    type: string
-    displayName: "VMSS Name"
-    default: is-vmss
-
-  - name: vmssInstanceId
-    type: string
-    displayName: "VMSS Instance ID"
-    default: "0"
+    default: rnd-aks-thevindu
 
   - name: namespace
     type: string
