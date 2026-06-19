@@ -19,8 +19,8 @@ parameters:
 
   - name: nodeName
     type: string
-    displayName: "Target Node Name  (pod mode only — leave blank to let scheduler pick)"
-    default: ""
+    displayName: "Target Node Name  (pod mode only — leave blank for daemonset)"
+    default: " "
 
   - name: tcpdumpInterface
     type: string
@@ -155,6 +155,8 @@ stages:
           - script: |
               FILTER_HOST="${{ parameters.tcpdumpFilterHost }}"
               FILTER_HOST="${FILTER_HOST// /}"
+              NODE_NAME="${{ parameters.nodeName }}"
+              NODE_NAME="${NODE_NAME// /}"
               OVERRIDES=(
                 "deploymentMode=${{ parameters.deploymentMode }}"
                 "captureMode=${{ parameters.captureMode }}"
@@ -169,8 +171,8 @@ stages:
                 "tcpdump.verbose=${{ parameters.tcpdumpVerbose }}"
               )
 
-              if [ -n "${{ parameters.nodeName }}" ]; then
-                OVERRIDES+=("pod.nodeName=${{ parameters.nodeName }}")
+              if [ -n "${NODE_NAME}" ]; then
+                OVERRIDES+=("pod.nodeName=${NODE_NAME}")
               fi
 
               OVERRIDE_STR=$(IFS=,; echo "${OVERRIDES[*]}")
