@@ -50,6 +50,11 @@ parameters:
     displayName: "Verbose mode  (print to stdout only, no .pcap file written)"
     default: false
 
+  - name: autoDestroy
+    type: boolean
+    displayName: "Auto-destroy after deploy  (helm uninstall runs automatically in the same pipeline run)"
+    default: false
+
 stages:
   - stage: Deploy
     displayName: Deploy NetProbe
@@ -199,4 +204,61 @@ stages:
               namespace: $(NAMESPACE)
               command: get
               arguments: 'pods -l app.kubernetes.io/name=netprobe -o wide'
+              outputFormat: ''
+
+  - stage: Destroy
+    displayName: Destroy NetProbe
+    dependsOn: Deploy
+    condition: and(succeeded(), eq('${{ parameters.autoDestroy }}', true))
+    jobs:
+      - job: DestroyNetProbe
+        displayName: helm uninstall netprobe
+        pool:
+          name: rnd-thevindu-vmss
+        steps:
+          - checkout: none
+
+          - bash: |
+              set -euo pipefail
+
+              LOCAL_BIN="$HOME/.local/bin"
+              mkdir -p "$LOCAL_BIN"
+              export PATH="$LOCAL_BIN:$PATH"
+              echo "##vso[task.prependpath]$LOCAL_BIN"
+
+              if ! command -v kubectl &>/dev/null; then
+                echo "Installing kubectl..."
+                KVER="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
+                curl -fsSLo "$LOCAL_BIN/kubectl" \
+                  "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl"
+                chmod +x "$LOCAL_BIN/kubectl"
+              fi
+              kubectl version --client
+
+              if ! command -v helm &>/dev/null; then
+                echo "Installing helm..."
+                curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 \
+                  | USE_SUDO=false HELM_INSTALL_DIR="$LOCAL_BIN" bash
+              fi
+              helm version --short
+            displayName: Install tools (kubectl, helm)
+
+          - task: HelmDeploy@0
+            displayName: Helm uninstall
+            continueOnError: true
+            inputs:
+              connectionType: 'Kubernetes Service Connection'
+              kubernetesServiceConnection: $(AKS_SERVICE_CONNECTION)
+              namespace: $(NAMESPACE)
+              command: uninstall
+              arguments: netprobe
+
+          - task: Kubernetes@1
+            displayName: Confirm resources removed
+            inputs:
+              connectionType: 'Kubernetes Service Connection'
+              kubernetesServiceEndpoint: $(AKS_SERVICE_CONNECTION)
+              namespace: $(NAMESPACE)
+              command: get
+              arguments: 'pods,daemonsets -l app.kubernetes.io/name=netprobe --ignore-not-found'
               outputFormat: ''
