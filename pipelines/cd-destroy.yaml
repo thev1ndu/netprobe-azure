@@ -1,10 +1,25 @@
 trigger: none
 
 parameters:
-  - name: kubernetesServiceConnection
+  - name: azureServiceConnection
     type: string
-    displayName: "Kubernetes Service Connection"
-    default: rnd-aks-thevindu
+    displayName: "Azure Resource Manager Service Connection"
+    default: thevindu-rnd-sc
+
+  - name: vmssResourceGroup
+    type: string
+    displayName: "VMSS Resource Group"
+    default: rg-thevindu
+
+  - name: vmssName
+    type: string
+    displayName: "VMSS Name"
+    default: is-vmss
+
+  - name: vmssInstanceId
+    type: string
+    displayName: "VMSS Instance ID"
+    default: "0"
 
   - name: namespace
     type: string
@@ -22,22 +37,44 @@ stages:
         steps:
           - checkout: none
 
-          - task: HelmDeploy@0
+          - task: AzureCLI@2
             displayName: Helm uninstall
             inputs:
-              connectionType: Kubernetes Service Connection
-              kubernetesServiceEndpoint: ${{ parameters.kubernetesServiceConnection }}
-              namespace: ${{ parameters.namespace }}
-              command: delete
-              releaseName: netprobe
+              azureSubscription: ${{ parameters.azureServiceConnection }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                OUTPUT=$(az vmss run-command invoke \
+                  --resource-group "${{ parameters.vmssResourceGroup }}" \
+                  --name "${{ parameters.vmssName }}" \
+                  --instance-id "${{ parameters.vmssInstanceId }}" \
+                  --command-id RunShellScript \
+                  --scripts "helm uninstall netprobe --namespace ${{ parameters.namespace }} 2>&1 || true" \
+                  --output json)
 
-          # Succeeds whether the resource was a Pod or DaemonSet;
-          # exits 0 if already gone (--ignore-not-found).
-          - task: Kubernetes@1
+                echo "$OUTPUT" | python3 -c "
+                import sys, json
+                data = json.load(sys.stdin)
+                print(data['value'][0]['message'])
+                "
+
+          - task: AzureCLI@2
             displayName: Confirm resources removed
             inputs:
-              connectionType: Kubernetes Service Connection
-              kubernetesServiceEndpoint: ${{ parameters.kubernetesServiceConnection }}
-              namespace: ${{ parameters.namespace }}
-              command: get
-              arguments: pods,daemonsets -l app.kubernetes.io/name=netprobe --ignore-not-found
+              azureSubscription: ${{ parameters.azureServiceConnection }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                OUTPUT=$(az vmss run-command invoke \
+                  --resource-group "${{ parameters.vmssResourceGroup }}" \
+                  --name "${{ parameters.vmssName }}" \
+                  --instance-id "${{ parameters.vmssInstanceId }}" \
+                  --command-id RunShellScript \
+                  --scripts "kubectl get pods,daemonsets -l app.kubernetes.io/name=netprobe -n ${{ parameters.namespace }} --ignore-not-found" \
+                  --output json)
+
+                echo "$OUTPUT" | python3 -c "
+                import sys, json
+                data = json.load(sys.stdin)
+                print(data['value'][0]['message'])
+                "

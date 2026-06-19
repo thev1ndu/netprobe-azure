@@ -7,54 +7,30 @@ Configure the ADO project once per cluster. After this, day-to-day use is just r
 ## Prerequisites
 
 - [01-azure-infra.md](01-azure-infra.md) completed
+- `is-vmss` created with `--orchestration-mode Uniform` and kubectl/helm installed (via cloud-init)
 - ADO project with access to the repo containing this pipeline
 
 ---
 
-## 1. Store the storage account key as a pipeline secret variable
+## 1. Create the Azure Resource Manager Service Connection
 
-The deploy pipeline reads the storage account key from a secret pipeline variable —
-no ARM Service Connection required.
-
-```bash
-# Fetch the key once and paste it into ADO
-az storage account keys list \
-  --resource-group rg-thevindu \
-  --account-name sa18436 \
-  --query "[0].value" -o tsv
-```
-
-In ADO:
-
-1. Open **NetProbe — CD Deploy** pipeline → **Edit → Variables**
-2. Add variable name: `storageAccountKey`
-3. Paste the key value
-4. Check **Keep this value secret** → **Save**
-
-The pipeline references it as `$(storageAccountKey)` — masked in all logs.
-
----
-
-## 2. Create the Kubernetes Service Connection
-
-The pipelines use a Kubernetes Service Connection to run `helm` and `kubectl` commands
-directly via native ADO tasks — no jumpbox, no SSH, no run-command required.
-
-> **Private cluster note:** ADO Microsoft-hosted agents cannot reach `privatelink.eastus2.azmk8s.io`
-> from outside the VNet. The Kubernetes SC works because the jumphost is configured as a
-> self-hosted ADO agent inside the VNet. See [AKS-SC.md](../../AKS-SC.md) for the full setup.
+The pipelines authenticate to Azure using an ARM Service Connection. This is used to:
+- Fetch the storage account key via `az storage account keys list`
+- Run `az vmss run-command invoke` on `is-vmss` to apply secrets and run helm/kubectl
 
 1. Go to **Project Settings → Service connections → New service connection**
-2. Select **Kubernetes**
-3. Authentication method: **Azure Subscription**
-4. Select subscription, resource group `rg-thevindu`, cluster `aks-wso2is`
-5. Namespace: `kube-system`
-6. Name it: `rnd-aks-thevindu`
+2. Select **Azure Resource Manager**
+3. Choose **Workload identity federation (automatic)** as the authentication method
+4. Set **Scope level** to **Resource Group**
+5. Select your subscription and the resource group `rg-thevindu`
+6. Name it: `thevindu-rnd-sc`
 7. Check **Grant access permission to all pipelines** → **Save**
+
+> If the service connection already exists (ID `9ebf9bd2-dc57-45a8-b591-c34cbea77d71`), skip this step.
 
 ---
 
-## 3. Register the Deploy pipeline
+## 2. Register the Deploy pipeline
 
 1. **Pipelines → New pipeline**
 2. Select your repo source (Azure Repos Git or GitHub)
@@ -65,7 +41,7 @@ directly via native ADO tasks — no jumpbox, no SSH, no run-command required.
 
 ---
 
-## 4. Register the Destroy pipeline
+## 3. Register the Destroy pipeline
 
 1. **Pipelines → New pipeline**
 2. Select your repo source
@@ -80,8 +56,7 @@ directly via native ADO tasks — no jumpbox, no SSH, no run-command required.
 
 After this document you have:
 
-- [ ] `storageAccountKey` secret variable set on the CD Deploy pipeline
-- [ ] Kubernetes Service Connection `rnd-aks-thevindu` created
+- [ ] ARM Service Connection `thevindu-rnd-sc` available (workload identity federation)
 - [ ] `NetProbe — CD Deploy` pipeline registered
 - [ ] `NetProbe — CD Destroy` pipeline registered
 
