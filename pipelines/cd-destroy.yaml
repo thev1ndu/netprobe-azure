@@ -23,10 +23,27 @@ stages:
           - checkout: none
 
           - bash: |
-              curl -sLO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-              sudo install kubectl /usr/local/bin/ && rm kubectl
-              curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-              curl -sL https://aka.ms/InstallAzureCLIDeb | bash
+              set -euo pipefail
+              LOCAL_BIN="$HOME/.local/bin"
+              mkdir -p "$LOCAL_BIN"
+              echo "##vso[task.prependpath]$LOCAL_BIN"
+
+              if ! command -v kubectl &>/dev/null; then
+                curl -sLO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+                chmod +x kubectl && mv kubectl "$LOCAL_BIN/"
+              fi
+              kubectl version --client
+
+              if ! command -v helm &>/dev/null; then
+                curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 \
+                  | USE_SUDO=false HELM_INSTALL_DIR="$LOCAL_BIN" bash
+              fi
+              helm version --short
+
+              if ! command -v az &>/dev/null; then
+                pip3 install --user azure-cli --quiet
+              fi
+              az version --output table
             displayName: Install tools (kubectl, helm, azure-cli)
 
           - task: HelmDeploy@0
