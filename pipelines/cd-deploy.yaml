@@ -1,31 +1,6 @@
 trigger: none
 
 parameters:
-  - name: aksServiceConnection
-    type: string
-    displayName: "AKS Service Connection"
-    default: rnd-aks-thevindu
-
-  - name: azureServiceConnection
-    type: string
-    displayName: "Azure Resource Manager Service Connection"
-    default: thevindu-rnd-sc
-
-  - name: storageResourceGroup
-    type: string
-    displayName: "Storage Resource Group"
-    default: rg-thevindu
-
-  - name: storageAccountName
-    type: string
-    displayName: "Storage Account Name"
-    default: sa18436
-
-  - name: namespace
-    type: string
-    displayName: "Kubernetes Namespace"
-    default: kube-system
-
   - name: deploymentMode
     type: string
     displayName: "Deployment Mode"
@@ -46,21 +21,6 @@ parameters:
     type: string
     displayName: "Target Node Name  (pod mode only — leave blank to let scheduler pick)"
     default: ""
-
-  - name: imageRegistry
-    type: string
-    displayName: "Container Registry  (e.g. acrrrrrrrr.azurecr.io)"
-    default: ""
-
-  - name: imageDigest
-    type: string
-    displayName: "Image Digest  (sha256:... — leave blank to use the digest baked into the chart)"
-    default: ""
-
-  - name: shareName
-    type: string
-    displayName: "Azure File Share Name"
-    default: fileshare
 
   - name: tcpdumpInterface
     type: string
@@ -153,13 +113,13 @@ stages:
           - task: AzureCLI@2
             displayName: Fetch storage account key
             inputs:
-              azureSubscription: ${{ parameters.azureServiceConnection }}
+              azureSubscription: $(AZURE_SERVICE_CONNECTION)
               scriptType: bash
               scriptLocation: inlineScript
               inlineScript: |
                 KEY=$(az storage account keys list \
-                  --resource-group "${{ parameters.storageResourceGroup }}" \
-                  --account-name "${{ parameters.storageAccountName }}" \
+                  --resource-group "$(STORAGE_RESOURCE_GROUP)" \
+                  --account-name "$(STORAGE_ACCOUNT_NAME)" \
                   --query "[0].value" -o tsv)
                 echo "##vso[task.setvariable variable=storageAccountKey;issecret=true]$KEY"
 
@@ -169,9 +129,9 @@ stages:
               kind: Secret
               metadata:
                 name: azure-storage-account-credentials-secret
-                namespace: ${{ parameters.namespace }}
+                namespace: $(NAMESPACE)
               stringData:
-                azurestorageaccountname: "${{ parameters.storageAccountName }}"
+                azurestorageaccountname: "$(STORAGE_ACCOUNT_NAME)"
                 azurestorageaccountkey: "$(storageAccountKey)"
               EOF
             displayName: Write storage secret manifest
@@ -180,8 +140,8 @@ stages:
             displayName: Upsert storage secret
             inputs:
               connectionType: 'Kubernetes Service Connection'
-              kubernetesServiceEndpoint: ${{ parameters.aksServiceConnection }}
-              namespace: ${{ parameters.namespace }}
+              kubernetesServiceEndpoint: $(AKS_SERVICE_CONNECTION)
+              namespace: $(NAMESPACE)
               command: apply
               useConfigurationFile: true
               configuration: $(Agent.TempDirectory)/storage-secret.yaml
@@ -194,7 +154,9 @@ stages:
                 "deploymentMode=${{ parameters.deploymentMode }}"
                 "captureMode=${{ parameters.captureMode }}"
                 "pod.name=netprobe"
-                "azureFileShare.shareName=${{ parameters.shareName }}"
+                "azureFileShare.shareName=$(SHARE_NAME)"
+                "image.registry=$(IMAGE_REGISTRY)"
+                "image.digest=$(IMAGE_DIGEST)"
                 "tcpdump.interface=${{ parameters.tcpdumpInterface }}"
                 "tcpdump.rotateSeconds=${{ parameters.tcpdumpRotateSeconds }}"
                 "tcpdump.filterHost=${FILTER_HOST}"
@@ -204,14 +166,6 @@ stages:
 
               if [ -n "${{ parameters.nodeName }}" ]; then
                 OVERRIDES+=("pod.nodeName=${{ parameters.nodeName }}")
-              fi
-
-              if [ -n "${{ parameters.imageRegistry }}" ]; then
-                OVERRIDES+=("image.registry=${{ parameters.imageRegistry }}")
-              fi
-
-              if [ -n "${{ parameters.imageDigest }}" ]; then
-                OVERRIDES+=("image.digest=${{ parameters.imageDigest }}")
               fi
 
               OVERRIDE_STR=$(IFS=,; echo "${OVERRIDES[*]}")
@@ -228,8 +182,8 @@ stages:
             displayName: Helm upgrade --install
             inputs:
               connectionType: 'Kubernetes Service Connection'
-              kubernetesServiceConnection: ${{ parameters.aksServiceConnection }}
-              namespace: ${{ parameters.namespace }}
+              kubernetesServiceConnection: $(AKS_SERVICE_CONNECTION)
+              namespace: $(NAMESPACE)
               command: upgrade
               chartType: FilePath
               chartPath: $(Agent.TempDirectory)/netprobe.tgz
@@ -241,8 +195,8 @@ stages:
             displayName: Show pod status
             inputs:
               connectionType: 'Kubernetes Service Connection'
-              kubernetesServiceEndpoint: ${{ parameters.aksServiceConnection }}
-              namespace: ${{ parameters.namespace }}
+              kubernetesServiceEndpoint: $(AKS_SERVICE_CONNECTION)
+              namespace: $(NAMESPACE)
               command: get
               arguments: 'pods -l app.kubernetes.io/name=netprobe -o wide'
               outputFormat: ''
