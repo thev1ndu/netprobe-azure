@@ -31,10 +31,6 @@ parameters:
     displayName: "Storage Account Name"
     default: sa18436
 
-  - name: storageAccountKey
-    type: string
-    displayName: "Storage Account Key (secret)"
-    default: ""
 
   - name: namespace
     type: string
@@ -116,6 +112,31 @@ stages:
         steps:
           - checkout: none
 
+          - task: AzurePowerShell@5
+            displayName: Fetch storage account key
+            inputs:
+              azureSubscription: ${{ parameters.azureServiceConnection }}
+              ScriptType: InlineScript
+              Inline: |
+                $key = (Get-AzStorageAccountKey `
+                  -ResourceGroupName "${{ parameters.vmssResourceGroup }}" `
+                  -Name "${{ parameters.storageAccountName }}")[0].Value
+                Write-Host "##vso[task.setvariable variable=storageAccountKey;issecret=true]$key"
+              azurePowerShellVersion: LatestVersion
+
+          - bash: |
+              cat > "$(Agent.TempDirectory)/storage-secret.yaml" <<EOF
+              apiVersion: v1
+              kind: Secret
+              metadata:
+                name: azure-storage-account-credentials-secret
+                namespace: ${{ parameters.namespace }}
+              stringData:
+                azurestorageaccountname: "${{ parameters.storageAccountName }}"
+                azurestorageaccountkey: "$(storageAccountKey)"
+              EOF
+            displayName: Write storage secret manifest
+
           - task: Kubernetes@1
             displayName: Upsert storage secret
             inputs:
@@ -124,15 +145,7 @@ stages:
               namespace: ${{ parameters.namespace }}
               command: apply
               useConfigurationFile: true
-              configuration: |
-                apiVersion: v1
-                kind: Secret
-                metadata:
-                  name: azure-storage-account-credentials-secret
-                  namespace: ${{ parameters.namespace }}
-                stringData:
-                  azurestorageaccountname: "${{ parameters.storageAccountName }}"
-                  azurestorageaccountkey: "${{ parameters.storageAccountKey }}"
+              configuration: $(Agent.TempDirectory)/storage-secret.yaml
               outputFormat: ''
 
           - script: |
