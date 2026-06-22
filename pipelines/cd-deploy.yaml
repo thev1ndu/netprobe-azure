@@ -50,11 +50,6 @@ parameters:
     displayName: "Verbose mode  (print to stdout only, no .pcap file written)"
     default: false
 
-  - name: autoDestroy
-    type: boolean
-    displayName: "Auto-destroy after deploy  (helm uninstall runs automatically in the same pipeline run)"
-    default: false
-
 stages:
   - stage: Deploy
     displayName: Deploy NetProbe
