@@ -5,7 +5,7 @@ stages:
     displayName: Destroy NetProbe
     jobs:
       - job: DestroyNetProbe
-        displayName: helm uninstall netprobe
+        displayName: Remove NetProbe from AKS
         pool:
           name: rnd-thevindu-vmss
         steps:
@@ -16,11 +16,9 @@ stages:
 
               LOCAL_BIN="$HOME/.local/bin"
               mkdir -p "$LOCAL_BIN"
-              # Make tools available BOTH in this step (export) and in later steps (prependpath).
               export PATH="$LOCAL_BIN:$PATH"
               echo "##vso[task.prependpath]$LOCAL_BIN"
 
-              # ----- kubectl -----
               if ! command -v kubectl &>/dev/null; then
                 echo "Installing kubectl..."
                 KVER="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
@@ -30,17 +28,16 @@ stages:
               fi
               kubectl version --client
 
-              # ----- helm -----
               if ! command -v helm &>/dev/null; then
                 echo "Installing helm..."
                 curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 \
                   | USE_SUDO=false HELM_INSTALL_DIR="$LOCAL_BIN" bash
               fi
               helm version --short
-            displayName: Install tools (kubectl, helm)
+            displayName: Install kubectl and Helm
 
           - task: HelmDeploy@0
-            displayName: Helm uninstall
+            displayName: Uninstall NetProbe Release
             continueOnError: true
             inputs:
               connectionType: 'Kubernetes Service Connection'
@@ -50,7 +47,7 @@ stages:
               arguments: netprobe
 
           - task: Kubernetes@1
-            displayName: Confirm resources removed
+            displayName: Verify NetProbe Resources Removed
             inputs:
               connectionType: 'Kubernetes Service Connection'
               kubernetesServiceEndpoint: $(AKS_SERVICE_CONNECTION)

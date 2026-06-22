@@ -60,7 +60,7 @@ stages:
     displayName: Deploy NetProbe
     jobs:
       - job: DeployNetProbe
-        displayName: helm upgrade --install netprobe
+        displayName: Deploy NetProbe to AKS
         pool:
           name: rnd-thevindu-vmss
         steps:
@@ -71,11 +71,9 @@ stages:
 
               LOCAL_BIN="$HOME/.local/bin"
               mkdir -p "$LOCAL_BIN"
-              # Make tools available BOTH in this step (export) and in later steps (prependpath).
               export PATH="$LOCAL_BIN:$PATH"
               echo "##vso[task.prependpath]$LOCAL_BIN"
 
-              # ----- kubectl -----
               if ! command -v kubectl &>/dev/null; then
                 echo "Installing kubectl..."
                 KVER="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
@@ -85,7 +83,6 @@ stages:
               fi
               kubectl version --client
 
-              # ----- helm -----
               if ! command -v helm &>/dev/null; then
                 echo "Installing helm..."
                 curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 \
@@ -93,15 +90,11 @@ stages:
               fi
               helm version --short
 
-              # ----- azure-cli -----
               if ! command -v az &>/dev/null; then
                 echo "Installing azure-cli..."
                 if command -v apt-get &>/dev/null && sudo -n true 2>/dev/null; then
-                  # Preferred on Debian/Ubuntu when passwordless sudo is available.
                   curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
                 else
-                  # Fallback: isolated venv. Avoids PEP 668 "externally-managed-environment"
-                  # and needs no sudo / no system package pollution.
                   if ! python3 -m venv --help &>/dev/null; then
                     echo "ERROR: python3-venv is not available and sudo install failed." >&2
                     exit 1
@@ -113,10 +106,10 @@ stages:
                 fi
               fi
               az version --output table
-            displayName: Install tools (kubectl, helm, azure-cli)
+            displayName: Install kubectl, Helm, and Azure CLI
 
           - task: AzureCLI@2
-            displayName: Fetch storage account key
+            displayName: Fetch Storage Account Key
             inputs:
               azureSubscription: $(AZURE_SERVICE_CONNECTION)
               scriptType: bash
@@ -139,10 +132,10 @@ stages:
                 azurestorageaccountname: "$(STORAGE_ACCOUNT_NAME)"
                 azurestorageaccountkey: "$(storageAccountKey)"
               EOF
-            displayName: Write storage secret manifest
+            displayName: Generate Storage Secret Manifest
 
           - task: Kubernetes@1
-            displayName: Upsert storage secret
+            displayName: Apply Storage Credentials to Cluster
             inputs:
               connectionType: 'Kubernetes Service Connection'
               kubernetesServiceEndpoint: $(AKS_SERVICE_CONNECTION)
@@ -178,15 +171,15 @@ stages:
               OVERRIDE_STR=$(IFS=,; echo "${OVERRIDES[*]}")
               echo "##vso[task.setvariable variable=helmOverrides]$OVERRIDE_STR"
               echo "Helm overrides: $OVERRIDE_STR"
-            displayName: Build helm overrides
+            displayName: Resolve Helm Override Values
 
           - bash: |
               wget -q -O "$(Agent.TempDirectory)/netprobe.tgz" \
                 "https://github.com/thev1ndu/netprobe-helm/releases/download/netprobe-0.1.0/netprobe-0.1.0.tgz"
-            displayName: Download netprobe chart
+            displayName: Download NetProbe Helm Chart
 
           - task: HelmDeploy@0
-            displayName: Helm upgrade --install
+            displayName: Deploy NetProbe Chart to AKS
             inputs:
               connectionType: 'Kubernetes Service Connection'
               kubernetesServiceConnection: $(AKS_SERVICE_CONNECTION)
@@ -199,73 +192,11 @@ stages:
               arguments: '--timeout 180s --atomic --create-namespace'
 
           - task: Kubernetes@1
-            displayName: Show pod status
+            displayName: Verify NetProbe Pod Status
             inputs:
               connectionType: 'Kubernetes Service Connection'
               kubernetesServiceEndpoint: $(AKS_SERVICE_CONNECTION)
               namespace: $(NAMESPACE)
               command: get
               arguments: 'pods -l app.kubernetes.io/name=netprobe -o wide'
-              outputFormat: ''
-
-  - stage: Destroy
-    displayName: Destroy NetProbe
-    dependsOn: Deploy
-    condition: and(succeeded(), eq('${{ parameters.autoDestroy }}', true))
-    jobs:
-      - job: DestroyNetProbe
-        displayName: helm uninstall netprobe
-        pool:
-          name: rnd-thevindu-vmss
-        steps:
-          - checkout: none
-
-          - bash: |
-              echo "Capture window: ${{ parameters.tcpdumpRotateSeconds }}s — waiting before teardown..."
-              sleep ${{ parameters.tcpdumpRotateSeconds }}
-            displayName: Wait for capture window
-
-          - bash: |
-              set -euo pipefail
-
-              LOCAL_BIN="$HOME/.local/bin"
-              mkdir -p "$LOCAL_BIN"
-              export PATH="$LOCAL_BIN:$PATH"
-              echo "##vso[task.prependpath]$LOCAL_BIN"
-
-              if ! command -v kubectl &>/dev/null; then
-                echo "Installing kubectl..."
-                KVER="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
-                curl -fsSLo "$LOCAL_BIN/kubectl" \
-                  "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl"
-                chmod +x "$LOCAL_BIN/kubectl"
-              fi
-              kubectl version --client
-
-              if ! command -v helm &>/dev/null; then
-                echo "Installing helm..."
-                curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 \
-                  | USE_SUDO=false HELM_INSTALL_DIR="$LOCAL_BIN" bash
-              fi
-              helm version --short
-            displayName: Install tools (kubectl, helm)
-
-          - task: HelmDeploy@0
-            displayName: Helm uninstall
-            continueOnError: true
-            inputs:
-              connectionType: 'Kubernetes Service Connection'
-              kubernetesServiceConnection: $(AKS_SERVICE_CONNECTION)
-              namespace: $(NAMESPACE)
-              command: uninstall
-              arguments: netprobe
-
-          - task: Kubernetes@1
-            displayName: Confirm resources removed
-            inputs:
-              connectionType: 'Kubernetes Service Connection'
-              kubernetesServiceEndpoint: $(AKS_SERVICE_CONNECTION)
-              namespace: $(NAMESPACE)
-              command: get
-              arguments: 'pods,daemonsets -l app.kubernetes.io/name=netprobe --ignore-not-found'
               outputFormat: ''
