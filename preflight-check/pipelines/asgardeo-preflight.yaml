@@ -43,18 +43,8 @@ parameters:
     type: object
     displayName: "Environments to scan (subscription/RG/SQL/workspace + AKS service connection)"
     default:
-      - name: prod-us
-        subscriptionId: ea3af8ec-73de-4e7c-870f-7a5975f7db2d
-        resourceGroup: rg-asgardeo-main-prod-eastus2-001
-        sqlServer: sql-asgardeo-main-prod-eastus2-001
-        logAnalyticsWorkspaceId: ""
-        aksServiceConnection: ""
-      - name: prod-eu
-        subscriptionId: ea3af8ec-73de-4e7c-870f-7a5975f7db2d
-        resourceGroup: rg-asgardeo-main-eupr-northeurope-001
-        sqlServer: sql-asgardeo-main-eupr-northeurope-001
-        logAnalyticsWorkspaceId: ""
-        aksServiceConnection: ""
+      - { name: "prod-us", subscriptionId: "ea3af8ec-73de-4e7c-870f-7a5975f7db2d", resourceGroup: "rg-asgardeo-main-prod-eastus2-001", sqlServer: "sql-asgardeo-main-prod-eastus2-001", logAnalyticsWorkspaceId: "", aksServiceConnection: "" }
+      - { name: "prod-eu", subscriptionId: "ea3af8ec-73de-4e7c-870f-7a5975f7db2d", resourceGroup: "rg-asgardeo-main-eupr-northeurope-001", sqlServer: "sql-asgardeo-main-eupr-northeurope-001", logAnalyticsWorkspaceId: "", aksServiceConnection: "" }
 
 variables:
   reportFile: $(Build.ArtifactStagingDirectory)/preflight-report.md
