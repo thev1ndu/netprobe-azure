@@ -45,10 +45,7 @@ parameters:
     default:
       - { name: "rnd-test", subscriptionId: "38785beb-5019-4896-8679-3d41ddacc4b1", resourceGroup: "rg-thevindu", sqlServer: "", logAnalyticsWorkspaceId: "e5d406b5-f761-48a7-9466-9d0d4a768f01", aksServiceConnection: "rnd-aks-thevindu" }
 
-variables:
-  azureServiceConnection: $(AZURE_SERVICE_CONNECTION)   
-  agentPool: $(AGENT_POOL)
-  gchatWebhookUrl: $(GCHAT_WEBHOOK_URL)                               
+variables:                            
   reportFile: $(Build.ArtifactStagingDirectory)/preflight-report.md
 
 stages:
@@ -59,7 +56,7 @@ stages:
         displayName: Run automated pre-flight data pulls
         timeoutInMinutes: 60
         pool:
-          name: ${{ variables.agentPool }}
+          name: $(AGENT_POOL)
         steps:
           - checkout: none
 
@@ -70,7 +67,7 @@ stages:
           - task: AzureCLI@2
             displayName: Run pre-flight checks
             inputs:
-              azureSubscription: ${{ variables.azureServiceConnection }}
+              azureSubscription: $(AZURE_SERVICE_CONNECTION)
               scriptType: bash
               scriptLocation: inlineScript
               inlineScript: |
@@ -246,11 +243,13 @@ stages:
 
           - bash: |
               set -euo pipefail
-              # Skip cleanly if the secret is unset (an undefined ADO variable leaves the
-              # macro literal, e.g. "$(GCHAT_WEBHOOK_URL)", rather than empty).
-              case "${GCHAT_WEBHOOK_URL:-}" in
-                ''|'$(GCHAT_WEBHOOK_URL)') echo "GCHAT_WEBHOOK_URL not set - skipping."; exit 0 ;;
-              esac
+
+              # Skip cleanly if webhook is not configured
+              if [ -z "${GCHAT_WEBHOOK_URL:-}" ]; then
+                echo "GCHAT_WEBHOOK_URL not set - skipping."
+                exit 0
+              fi
+
               ANOMALIES=$(grep "WARNING:" "$(reportFile)" | sed -E 's/^[[:space:]]*-?[[:space:]]*WARNING:[[:space:]]*//' || true)
               COUNT=$(printf '%s\n' "$ANOMALIES" | grep -c . || true)
 
@@ -260,7 +259,7 @@ stages:
               else
                 SECTION=$(printf '%s' "$ANOMALIES" | jq -R -s --arg c "$COUNT" '
                   {header:("Anomalies ("+$c+")"),
-                   widgets:(split("\n")|map(select(length>0))[:30]
+                  widgets:(split("\n")|map(select(length>0))[:30]
                             |map({decoratedText:{startIcon:{materialIcon:{name:"warning"}},text:.}}))}')
                 SUB="$COUNT anomaly(ies) detected"
               fi
@@ -272,11 +271,11 @@ stages:
                           imageType:"CIRCLE",imageUrl:"https://wso2.cachefly.net/wso2/sites/all/image_resources/asgardeo-logo-deverloper-page.webp"},
                   sections:[ $section,
                     {widgets:[{buttonList:{buttons:[{text:"Open pipeline run",
-                       onClick:{openLink:{url:$url}}}]}}]} ]}}]}')
+                      onClick:{openLink:{url:$url}}}]}}]} ]}}]}')
 
               curl -sS -H "Content-Type: application/json" -d "$CARD" "$GCHAT_WEBHOOK_URL" >/dev/null \
                 && echo "Posted card to Google Chat ($COUNT anomalies)."
             displayName: Notify on Google Chat
             env:
-              GCHAT_WEBHOOK_URL: ${{ variables.gchatWebhookUrl }}
+              GCHAT_WEBHOOK_URL: $(GCHAT_WEBHOOK_URL)
               BUILD_URL: $(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)
