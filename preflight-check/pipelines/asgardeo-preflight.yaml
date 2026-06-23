@@ -39,44 +39,15 @@ parameters:
     displayName: "Flag week-over-week cost increase over N% (default 20)"
     default: 20
 
-  # ---- Anomaly-detection parameters (drive test-setup/anomaly-queries.kql) ----
-  - name: anomalySensitivity
-    type: number
-    displayName: "series_decompose_anomalies score threshold; lower = more sensitive (default 1.5)"
-    default: 1.5
-
-  - name: newErrorRecentHours
-    type: number
-    displayName: "Recent window (hours) vs baseline for new-error / spike / drop checks (default 24)"
-    default: 24
-
-  - name: tenantErrorSpikeFactor
-    type: number
-    displayName: "Flag a tenant whose recent errors exceed N x its trailing daily average (default 3)"
-    default: 3
-
-  - name: http5xxRatioPercentThreshold
-    type: number
-    displayName: "Flag any hour whose 5xx share of Frontdoor responses exceeds N% (default 5)"
-    default: 5
-
-  - name: trafficDropPercentThreshold
-    type: number
-    displayName: "Flag a tenant whose recent traffic dropped >= N% vs baseline (default 50)"
-    default: 50
-
   - name: environments
     type: object
     displayName: "Environments to scan (subscription/RG/SQL/workspace + AKS service connection)"
     default:
-      # Test env: matches the resources created by test-setup/ in the rnd subscription
-      # that the AZURE_SERVICE_CONNECTION service principal (asgardeo-rnd-001) can access.
       - { name: "rnd-test", subscriptionId: "38785beb-5019-4896-8679-3d41ddacc4b1", resourceGroup: "rg-thevindu", sqlServer: "", logAnalyticsWorkspaceId: "e5d406b5-f761-48a7-9466-9d0d4a768f01", aksServiceConnection: "rnd-aks-thevindu" }
-      # Prod (requires a service connection whose SP has access to subscription ea3af8ec-...):
-      # - { name: "prod-us", subscriptionId: "ea3af8ec-73de-4e7c-870f-7a5975f7db2d", resourceGroup: "rg-asgardeo-main-prod-eastus2-001", sqlServer: "sql-asgardeo-main-prod-eastus2-001", logAnalyticsWorkspaceId: "", aksServiceConnection: "" }
-      # - { name: "prod-eu", subscriptionId: "ea3af8ec-73de-4e7c-870f-7a5975f7db2d", resourceGroup: "rg-asgardeo-main-eupr-northeurope-001", sqlServer: "sql-asgardeo-main-eupr-northeurope-001", logAnalyticsWorkspaceId: "", aksServiceConnection: "" }
 
 variables:
+  azureServiceConnection: $(AZURE_SERVICE_CONNECTION)   
+  agentPool: $(AGENT_POOL)                               
   reportFile: $(Build.ArtifactStagingDirectory)/preflight-report.md
 
 stages:
@@ -87,7 +58,7 @@ stages:
         displayName: Run automated pre-flight data pulls
         timeoutInMinutes: 60
         pool:
-          name: rnd-thevindu-vmss
+          name: ${{ variables.agentPool }}
         steps:
           - checkout: none
 
@@ -96,74 +67,13 @@ stages:
             displayName: Install jq
 
           - task: AzureCLI@2
-            displayName: Validate access (diagnostics)
-            continueOnError: true
-            inputs:
-              azureSubscription: thevindu-rnd-sc
-              scriptType: bash
-              scriptLocation: inlineScript
-              inlineScript: |
-                set -uo pipefail
-                SUB="38785beb-5019-4896-8679-3d41ddacc4b1"
-                RG="rg-thevindu"
-                WS="e5d406b5-f761-48a7-9466-9d0d4a768f01"
-                pass() { echo "PASS: $1"; }
-                fail() { echo "FAIL: $1"; }
-
-                echo "=== Identity ==="
-                az account show --query "{sub:id, name:name, tenant:tenantId}" -o json
-
-                echo "=== Subscription set ==="
-                az account set --subscription "$SUB" && pass "az account set $SUB" || fail "az account set $SUB"
-
-                echo "=== Resource group ==="
-                az group show -n "$RG" -o tsv --query name >/dev/null 2>&1 && pass "read rg $RG" || fail "read rg $RG"
-
-                echo "=== Log Analytics query (workspace $WS) ==="
-                if az monitor log-analytics query -w "$WS" --analytics-query "print x=1" -o json 2>/tmp/la.err; then
-                  pass "log-analytics query"
-                  echo "--- _CL table row counts (last 7d; 0 = data not landed yet, can take 5-15 min) ---"
-                  for T in Usage_CL FrontdoorAccessLog_CL ContainerLog_CL KubePodInventory_CL; do
-                    C=$(az monitor log-analytics query -w "$WS" --analytics-query "$T | where TimeGenerated > ago(7d) | count" -o tsv --query "[0].Count" 2>/dev/null || echo "?")
-                    echo "  $T: ${C:-0} rows"
-                  done
-                else
-                  fail "log-analytics query"; cat /tmp/la.err
-                fi
-
-                echo "=== Key Vault list ==="
-                az keyvault list --query "[].name" -o tsv 2>/tmp/kv.err && pass "keyvault list" || { fail "keyvault list"; cat /tmp/kv.err; }
-
-                echo "=== Storage accounts ==="
-                az storage account list -g "$RG" --query "[].name" -o tsv 2>/dev/null && pass "storage list" || fail "storage list"
-
-                echo "=== Cost management ==="
-                if az costmanagement query --type ActualCost --timeframe MonthToDate \
-                     --dataset-aggregation '{"total":{"name":"Cost","function":"Sum"}}' \
-                     --scope "/subscriptions/$SUB" -o json 2>/tmp/cost.err >/dev/null; then
-                  pass "cost query"
-                else
-                  fail "cost query"; cat /tmp/cost.err
-                fi
-
-                echo "=== Secure score ==="
-                az security secure-scores list -o json 2>/dev/null >/dev/null && pass "secure score" || fail "secure score (Defender/perms)"
-
-                echo "=== Diagnostics complete (non-blocking) ==="
-
-          - task: AzureCLI@2
             displayName: Run pre-flight checks
             inputs:
-              azureSubscription: thevindu-rnd-sc
+              azureSubscription: ${{ variables.azureServiceConnection }}
               scriptType: bash
               scriptLocation: inlineScript
               inlineScript: |
-                # NOTE: deliberately NOT using `set -e`. Every check below is best-effort
-                # (guarded with `|| true` / `2>/dev/null` / `// 0`); a single failing data
-                # pull must degrade that one line, not abort the whole report. `-u`/pipefail
-                # are kept. Breadcrumbs go to stderr so the console is never blank on failure.
                 set -uo pipefail
-                trap 'echo ">> last command exited $? at line $LINENO" >&2' ERR
                 REPORT="$(reportFile)"
                 LOOKBACK="${{ parameters.lookbackDays }}"
                 ERR_TH="${{ parameters.errorCountDailyThreshold }}"
@@ -171,11 +81,6 @@ stages:
                 SQL_TH="${{ parameters.sqlStorageWarnPercent }}"
                 CERT_TH="${{ parameters.certExpiryWarningDays }}"
                 COST_TH="${{ parameters.costIncreasePercentThreshold }}"
-                SENS="${{ parameters.anomalySensitivity }}"
-                RECENT_H="${{ parameters.newErrorRecentHours }}"
-                TSPIKE="${{ parameters.tenantErrorSpikeFactor }}"
-                P5XX="${{ parameters.http5xxRatioPercentThreshold }}"
-                DROP="${{ parameters.trafficDropPercentThreshold }}"
                 ENVS='${{ convertToJson(parameters.environments) }}'
                 SUBS=$(echo "$ENVS" | jq -r '[.[].subscriptionId]|unique|.[]')
 
@@ -197,7 +102,6 @@ stages:
                     echo "- WARNING: subscription \`$SUB\` not accessible to this service connection - environment skipped." >> "$REPORT"
                     continue
                   fi
-                  echo ">> scanning env [$NAME] rg=$RG sub=$SUB ws=${WS:-<none>}" >&2
                   echo -e "\n## [$NAME] $RG" >> "$REPORT"
 
                   if [ -z "$WS" ] || [ "$WS" = "null" ]; then
@@ -229,55 +133,6 @@ stages:
 
                     TRAF=$(la 'FrontdoorAccessLog_CL | extend reqUri = tostring(requestUri_s) | extend tenant_from_path = extract(@"/t/([^/]+)", 1, reqUri) | extend custom_domain = extract(@"https?://([^/:]+)", 1, reqUri) | extend tenant = case(isnotempty(tenant_from_path), tenant_from_path, isnotempty(custom_domain) and custom_domain !contains "asgardeo.io", custom_domain, "") | where isnotempty(tenant) | summarize request_count = count() by tenant | top 5 by request_count desc' | jq -r '[.[]|"\(.tenant)=\(.request_count)"]|join(", ")')
                     [ -n "$TRAF" ] && echo "  - Top traffic tenants: ${TRAF}" >> "$REPORT" || true
-
-                    # ---------- Anomaly detection (test-setup/anomaly-queries.kql) ----------
-                    # Each query returns rows ONLY when anomalous, so a non-empty result is a
-                    # finding. Parameters: anomalySensitivity, newErrorRecentHours,
-                    # tenantErrorSpikeFactor, http5xxRatioPercentThreshold, trafficDropPercentThreshold.
-                    echo "- Anomaly detection (look-back ${LOOKBACK}d, recent ${RECENT_H}h, sensitivity ${SENS}):" >> "$REPORT"
-                    ANOM=0
-
-                    A=$(la "Usage_CL | make-series VolGB = sum(Quantity_d/1000.) default=0 on TimeGenerated from ago(${LOOKBACK}d) to now() step 1h | extend (flag,score,baseline)=series_decompose_anomalies(VolGB, ${SENS}) | mv-expand TimeGenerated to typeof(datetime), VolGB to typeof(double), flag to typeof(long), baseline to typeof(double) | where flag != 0 | project t=format_datetime(TimeGenerated,'MM-dd HH:mm'), v=round(VolGB,1), b=round(baseline,1), dir=iff(flag>0,'spike','drop')")
-                    if [ "$(echo "$A" | jq 'length')" -gt 0 ]; then
-                      echo "  - WARNING: Ingestion-volume anomaly: $(echo "$A" | jq -r '[.[]|"\(.t) \(.dir) \(.v)GB(base \(.b))"]|join("; ")' | cut -c1-280)" >> "$REPORT"; ANOM=1
-                    fi
-
-                    A=$(la "FrontdoorAccessLog_CL | where Category_s =~ 'FrontdoorAccessLog' | make-series Requests = count() default=0 on TimeGenerated from ago(${LOOKBACK}d) to now() step 1h | extend (flag,score,baseline)=series_decompose_anomalies(Requests, ${SENS}) | mv-expand TimeGenerated to typeof(datetime), Requests to typeof(long), flag to typeof(long), baseline to typeof(double) | where flag != 0 | project t=format_datetime(TimeGenerated,'MM-dd HH:mm'), r=Requests, b=round(baseline,0), dir=iff(flag>0,'spike','drop')")
-                    if [ "$(echo "$A" | jq 'length')" -gt 0 ]; then
-                      echo "  - WARNING: Frontdoor traffic anomaly: $(echo "$A" | jq -r '[.[]|"\(.t) \(.dir) \(.r)req(base \(.b))"]|join("; ")' | cut -c1-280)" >> "$REPORT"; ANOM=1
-                    fi
-
-                    A=$(la "ContainerLog_CL | where LogEntry_s has_cs ': ERROR' | make-series Errors = count() default=0 on TimeGenerated from ago(${LOOKBACK}d) to now() step 1h | extend (flag,score,baseline)=series_decompose_anomalies(Errors, ${SENS}) | mv-expand TimeGenerated to typeof(datetime), Errors to typeof(long), flag to typeof(long), baseline to typeof(double) | where flag > 0 | project t=format_datetime(TimeGenerated,'MM-dd HH:mm'), e=Errors, b=round(baseline,0)")
-                    if [ "$(echo "$A" | jq 'length')" -gt 0 ]; then
-                      echo "  - WARNING: Error-rate burst: $(echo "$A" | jq -r '[.[]|"\(.t) \(.e)err(base \(.b))"]|join("; ")' | cut -c1-280)" >> "$REPORT"; ANOM=1
-                    fi
-
-                    A=$(la "ContainerLog_CL | where TimeGenerated > ago(${LOOKBACK}d) | where LogEntry_s has_cs ': ERROR' | parse LogEntry_s with * ' : ERROR {' Class '}' Rest | where isnotempty(Class) | extend Signature = strcat(Class, ' |', substring(tostring(Rest), 0, 60)) | extend Window = iff(TimeGenerated > ago(${RECENT_H}h), 'recent', 'baseline') | summarize recent=countif(Window=='recent'), baseline=countif(Window=='baseline') by Signature | where baseline == 0 and recent > 0 | project Signature, recent | top 10 by recent desc")
-                    if [ "$(echo "$A" | jq 'length')" -gt 0 ]; then
-                      echo "  - WARNING: New error signature(s) in last ${RECENT_H}h: $(echo "$A" | jq -r '[.[]|"\(.Signature) (x\(.recent))"]|join("; ")' | cut -c1-280)" >> "$REPORT"; ANOM=1
-                    fi
-
-                    A=$(la "ContainerLog_CL | where TimeGenerated > ago(${LOOKBACK}d) | where LogEntry_s has_cs ': ERROR' | parse LogEntry_s with * 'Tenant: [' TenantName ']' * | where isnotempty(TenantName) | extend Window = iff(TimeGenerated > ago(${RECENT_H}h), 'recent', 'baseline') | summarize recent=countif(Window=='recent'), baselinePerDay=toreal(countif(Window=='baseline')) / ((${LOOKBACK}d - ${RECENT_H}h)/1d) by TenantName | where baselinePerDay > 0 and recent > ${TSPIKE} * baselinePerDay | project TenantName, recent, factor=round(recent/baselinePerDay,1) | top 10 by factor desc")
-                    if [ "$(echo "$A" | jq 'length')" -gt 0 ]; then
-                      echo "  - WARNING: Per-tenant error spike (>= ${TSPIKE}x baseline): $(echo "$A" | jq -r '[.[]|"\(.TenantName) x\(.factor) (\(.recent) recent)"]|join("; ")' | cut -c1-280)" >> "$REPORT"; ANOM=1
-                    fi
-
-                    A=$(la "FrontdoorAccessLog_CL | where Category_s =~ 'FrontdoorAccessLog' | where TimeGenerated > ago(${LOOKBACK}d) | extend code = toint(httpStatusCode_s) | summarize total=count(), errors=countif(code >= 500) by bin(TimeGenerated, 1h) | extend pct5xx = round(100.0*errors/total, 2) | where total > 0 and pct5xx > ${P5XX} | project t=format_datetime(TimeGenerated,'MM-dd HH:mm'), pct5xx, errors | order by t asc")
-                    if [ "$(echo "$A" | jq 'length')" -gt 0 ]; then
-                      echo "  - WARNING: HTTP 5xx ratio > ${P5XX}%: $(echo "$A" | jq -r '[.[]|"\(.t) \(.pct5xx)% (\(.errors) errs)"]|join("; ")' | cut -c1-280)" >> "$REPORT"; ANOM=1
-                    fi
-
-                    A=$(la "FrontdoorAccessLog_CL | where Category_s =~ 'FrontdoorAccessLog' | where TimeGenerated > ago(${LOOKBACK}d) | extend endpoint = extract(@'(/[^?]*)', 1, tostring(requestUri_s)) | where isnotempty(endpoint) | summarize p95=percentile(timeTaken_d, 95), n=count() by endpoint | where p95 > ${LAT_TH} | project endpoint, p95=round(p95,3), n | top 10 by p95 desc")
-                    if [ "$(echo "$A" | jq 'length')" -gt 0 ]; then
-                      echo "  - WARNING: Endpoint latency p95 > ${LAT_TH}s: $(echo "$A" | jq -r '[.[]|"\(.endpoint) \(.p95)s"]|join("; ")' | cut -c1-280)" >> "$REPORT"; ANOM=1
-                    fi
-
-                    A=$(la "FrontdoorAccessLog_CL | where Category_s =~ 'FrontdoorAccessLog' | where TimeGenerated > ago(${LOOKBACK}d) | extend reqUri = tostring(requestUri_s) | extend tenant_from_path = extract(@'/t/([^/]+)', 1, reqUri) | extend custom_domain = extract(@'https?://([^/:]+)', 1, reqUri) | extend tenant = case(isnotempty(tenant_from_path), tenant_from_path, isnotempty(custom_domain) and custom_domain !contains 'asgardeo.io', custom_domain, '') | where isnotempty(tenant) | extend Window = iff(TimeGenerated > ago(${RECENT_H}h), 'recent', 'baseline') | summarize recent=countif(Window=='recent'), baselinePerDay=toreal(countif(Window=='baseline')) / ((${LOOKBACK}d - ${RECENT_H}h)/1d) by tenant | where baselinePerDay > 0 and recent < baselinePerDay * (1 - ${DROP}/100.0) | project tenant, dropPct=round(100.0*(baselinePerDay-recent)/baselinePerDay,1) | top 10 by dropPct desc")
-                    if [ "$(echo "$A" | jq 'length')" -gt 0 ]; then
-                      echo "  - WARNING: Per-tenant traffic drop >= ${DROP}%: $(echo "$A" | jq -r '[.[]|"\(.tenant) -\(.dropPct)%"]|join("; ")' | cut -c1-280)" >> "$REPORT"; ANOM=1
-                    fi
-
-                    [ "$ANOM" -eq 0 ] && echo "  - No time-series / baseline anomalies detected." >> "$REPORT" || true
                   else
                     echo "- WARNING: No Log Analytics workspace in \`$RG\` - log checks skipped." >> "$REPORT"
                   fi
@@ -326,7 +181,6 @@ stages:
                     echo "- WARNING: subscription \`$SUB\` not accessible to this service connection - skipped." >> "$REPORT"
                     continue
                   fi
-                  echo ">> subscription-level checks for $SUB (keyvault certs, cost, secure score)" >&2
                   echo -e "\n## Subscription $SUB" >> "$REPORT"
 
                   for V in $(az keyvault list --query "[].name" -o tsv 2>/dev/null || true); do
@@ -382,9 +236,7 @@ stages:
                   [ -n "$TOP" ] && printf -- '- Node utilisation (name / CPU%% / mem%%):\n```\n%s\n```\n' "$TOP" >> "$REPORT" || true
                 displayName: AKS pod/node check [${{ env.name }}]
 
-          - bash: |
-              echo "===== CONSOLIDATED PRE-FLIGHT REPORT ====="
-              cat "$(reportFile)"
+          - bash: cat "$(reportFile)"
             displayName: Print consolidated report
 
           - publish: $(reportFile)
@@ -393,7 +245,11 @@ stages:
 
           - bash: |
               set -euo pipefail
-              [ -z "${GCHAT_WEBHOOK_URL:-}" ] && { echo "GCHAT_WEBHOOK_URL not set - skipping."; exit 0; }
+              # Skip cleanly if the secret is unset (an undefined ADO variable leaves the
+              # macro literal, e.g. "$(GCHAT_WEBHOOK_URL)", rather than empty).
+              case "${GCHAT_WEBHOOK_URL:-}" in
+                ''|'$(GCHAT_WEBHOOK_URL)') echo "GCHAT_WEBHOOK_URL not set - skipping."; exit 0 ;;
+              esac
               ANOMALIES=$(grep "WARNING:" "$(reportFile)" | sed -E 's/^[[:space:]]*-?[[:space:]]*WARNING:[[:space:]]*//' || true)
               COUNT=$(printf '%s\n' "$ANOMALIES" | grep -c . || true)
 
@@ -419,7 +275,7 @@ stages:
 
               curl -sS -H "Content-Type: application/json" -d "$CARD" "$GCHAT_WEBHOOK_URL" >/dev/null \
                 && echo "Posted card to Google Chat ($COUNT anomalies)."
-            displayName: Post summary card to Google Chat (optional)
+            displayName: Notify on Google Chat
             env:
-              GCHAT_WEBHOOK_URL: "https://chat.googleapis.com/v1/spaces/AAQA2Wv5Ii4/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=0QZf67KuelefwEkjhby5zxoT35dypYDl4R-KWE7zkxw"
+              GCHAT_WEBHOOK_URL: $(GCHAT_WEBHOOK_URL)
               BUILD_URL: $(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)

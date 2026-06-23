@@ -2,30 +2,30 @@
 
 ## 1. Agent Pool
 
-The pipeline runs on a self-hosted VMSS pool. Set this once in the job definition:
+The pool name comes from the `AGENT_POOL` pipeline variable (§2). The YAML aliases
+it as `agentPool: $(AGENT_POOL)` and the `pool:` block references
+`${{ variables.agentPool }}`, which compiles to `pool: name: $(AGENT_POOL)` and
+resolves at job init. `AGENT_POOL` must therefore be a Variable-Group / UI variable
+(available at initialization) — not a runtime/output variable.
 
-```yaml
-pool:
-  name: rnd-thevindu-vmss
-```
-
-If you use a Microsoft-hosted agent instead, replace with:
-
-```yaml
-pool:
-  vmImage: ubuntu-latest
-```
+For a Microsoft-hosted agent, swap the `pool:` block to `vmImage: ubuntu-latest`
+instead (the image must have `az` + `jq`).
 
 ---
 
-## 2. Azure DevOps Pipeline Variables
+## 2. Pipeline Variables
 
-Set these in **Pipelines → Edit → Variables** (or a Variable Group linked to the pipeline).
+Set these in **Pipelines → Edit → Variables** (or a Variable Group linked to the
+pipeline). The YAML `variables:` block only **aliases** them
+(`azureServiceConnection: $(AZURE_SERVICE_CONNECTION)`, `agentPool: $(AGENT_POOL)`),
+so the values live entirely with you. `GCHAT_WEBHOOK_URL` is a **secret** — set it
+in the ADO UI only, never in the YAML.
 
 | Variable | Secret? | Description |
 |---|---|---|
-| `AZURE_SERVICE_CONNECTION` | No | Name of the Azure Resource Manager service connection used by the `AzureCLI@2` task. Must have the IAM roles listed in §4. |
-| `GCHAT_WEBHOOK_URL` | **Yes** | Incoming webhook URL for the Google Chat space. If blank/unset, the notification step is silently skipped — the rest of the pipeline still runs. |
+| `AZURE_SERVICE_CONNECTION` | No | Name of the ARM service connection used by the `AzureCLI@2` task. Must have the IAM roles in §4. The connection must also be authorized for this pipeline (Grant access permission) since it is referenced via a variable. |
+| `AGENT_POOL` | No | Self-hosted agent pool name (e.g. `rnd-thevindu-vmss`). |
+| `GCHAT_WEBHOOK_URL` | **Yes** | Incoming webhook for the Google Chat space. If unset, the notification step skips cleanly — the rest of the pipeline still runs. Consumed as `$(GCHAT_WEBHOOK_URL)`. |
 
 ---
 
@@ -153,11 +153,11 @@ The pipeline header notes these checks must be done by the on-call engineer manu
 
 ## 10. Quick-Start Checklist
 
-- [ ] Create / verify Azure RM service connection → set `AZURE_SERVICE_CONNECTION` variable
+- [ ] Create / verify Azure RM service connection → set `azureServiceConnection` variable
 - [ ] Assign required IAM roles to the service principal (§4)
 - [ ] Fill in correct `subscriptionId`, `resourceGroup`, `sqlServer` for each environment in `parameters.environments`
 - [ ] (Optional) Populate `logAnalyticsWorkspaceId` per env, or leave blank for auto-discovery
 - [ ] (Optional) Create Kubernetes service connections and fill `aksServiceConnection` per env
-- [ ] (Optional) Create Google Chat webhook → set `GCHAT_WEBHOOK_URL` secret variable
-- [ ] Confirm agent pool name matches (`rnd-thevindu-vmss`) or update to your pool
+- [ ] (Optional) Create Google Chat webhook → set `GCHAT_WEBHOOK_URL` secret variable (ADO UI only)
+- [ ] Confirm `agentPool` variable matches your pool (default `rnd-thevindu-vmss`)
 - [ ] Save and run the pipeline manually once to validate before relying on the Monday schedule
