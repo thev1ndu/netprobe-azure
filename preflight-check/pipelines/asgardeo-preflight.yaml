@@ -58,7 +58,9 @@ parameters:
     displayName: "Flag week-over-week cost increase over N% (default 20)"
     default: 20
 
-  # Environments to sweep; each entry is one region/deployment. Fields:
+  # Environments to sweep, as a JSON array string (editable in the Run dialog;
+  # ADO has no "json" param type, so this is a string parsed with jq). Each
+  # object is one region/deployment. Fields:
   #   name                    - label shown in the report heading
   #   subscriptionId          - subscription the resources live in; the ARM
   #                             service connection must be able to read it
@@ -70,21 +72,13 @@ parameters:
   #                             auto-discover the first cluster in the RG
   # Cert/cost/secure-score run once per UNIQUE subscriptionId in this list.
   - name: environments
-    type: object
-    displayName: "Environments to scan (region -> subscription/RG/SQL/workspace/AKS)"
-    default:
-      - name: prod-us
-        subscriptionId: ea3af8ec-73de-4e7c-870f-7a5975f7db2d
-        resourceGroup: rg-asgardeo-main-prod-eastus2-001
-        sqlServer: sql-asgardeo-main-prod-eastus2-001
-        logAnalyticsWorkspaceId: ""
-        aksName: ""
-      - name: prod-eu
-        subscriptionId: ea3af8ec-73de-4e7c-870f-7a5975f7db2d
-        resourceGroup: rg-asgardeo-main-eupr-northeurope-001
-        sqlServer: sql-asgardeo-main-eupr-northeurope-001
-        logAnalyticsWorkspaceId: ""
-        aksName: ""
+    type: string
+    displayName: "Environments to scan, JSON array (subscription/RG/SQL/workspace/AKS)"
+    default: >-
+      [
+      {"name": "prod-us", "subscriptionId": "ea3af8ec-73de-4e7c-870f-7a5975f7db2d", "resourceGroup": "rg-asgardeo-main-prod-eastus2-001", "sqlServer": "sql-asgardeo-main-prod-eastus2-001", "logAnalyticsWorkspaceId": "", "aksName": ""},
+      {"name": "prod-eu", "subscriptionId": "ea3af8ec-73de-4e7c-870f-7a5975f7db2d", "resourceGroup": "rg-asgardeo-main-eupr-northeurope-001", "sqlServer": "sql-asgardeo-main-eupr-northeurope-001", "logAnalyticsWorkspaceId": "", "aksName": ""}
+      ]
 
 variables:
   reportFile: $(Build.ArtifactStagingDirectory)/preflight-report.md
@@ -116,7 +110,7 @@ stages:
                 SQL_TH="${{ parameters.sqlStorageWarnPercent }}"
                 CERT_TH="${{ parameters.certExpiryWarningDays }}"
                 COST_TH="${{ parameters.costIncreasePercentThreshold }}"
-                ENVS='${{ convertToJson(parameters.environments) }}'
+                ENVS='${{ parameters.environments }}'
                 SUBS=$(echo "$ENVS" | jq -r '[.[].subscriptionId]|unique|.[]')
 
                 {
