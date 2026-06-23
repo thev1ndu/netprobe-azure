@@ -43,8 +43,12 @@ parameters:
     type: object
     displayName: "Environments to scan (subscription/RG/SQL/workspace + AKS service connection)"
     default:
-      - { name: "prod-us", subscriptionId: "ea3af8ec-73de-4e7c-870f-7a5975f7db2d", resourceGroup: "rg-asgardeo-main-prod-eastus2-001", sqlServer: "sql-asgardeo-main-prod-eastus2-001", logAnalyticsWorkspaceId: "", aksServiceConnection: "" }
-      - { name: "prod-eu", subscriptionId: "ea3af8ec-73de-4e7c-870f-7a5975f7db2d", resourceGroup: "rg-asgardeo-main-eupr-northeurope-001", sqlServer: "sql-asgardeo-main-eupr-northeurope-001", logAnalyticsWorkspaceId: "", aksServiceConnection: "" }
+      # Test env: matches the resources created by test-setup/ in the rnd subscription
+      # that the AZURE_SERVICE_CONNECTION service principal (asgardeo-rnd-001) can access.
+      - { name: "rnd-test", subscriptionId: "38785beb-5019-4896-8679-3d41ddacc4b1", resourceGroup: "rg-thevindu", sqlServer: "", logAnalyticsWorkspaceId: "e5d406b5-f761-48a7-9466-9d0d4a768f01", aksServiceConnection: "rnd-aks-thevindu" }
+      # Prod (requires a service connection whose SP has access to subscription ea3af8ec-...):
+      # - { name: "prod-us", subscriptionId: "ea3af8ec-73de-4e7c-870f-7a5975f7db2d", resourceGroup: "rg-asgardeo-main-prod-eastus2-001", sqlServer: "sql-asgardeo-main-prod-eastus2-001", logAnalyticsWorkspaceId: "", aksServiceConnection: "" }
+      # - { name: "prod-eu", subscriptionId: "ea3af8ec-73de-4e7c-870f-7a5975f7db2d", resourceGroup: "rg-asgardeo-main-eupr-northeurope-001", sqlServer: "sql-asgardeo-main-eupr-northeurope-001", logAnalyticsWorkspaceId: "", aksServiceConnection: "" }
 
 variables:
   reportFile: $(Build.ArtifactStagingDirectory)/preflight-report.md
@@ -68,7 +72,7 @@ stages:
           - task: AzureCLI@2
             displayName: Run pre-flight checks
             inputs:
-              azureSubscription: $(AZURE_SERVICE_CONNECTION)
+              azureSubscription: thevindu-rnd-sc
               scriptType: bash
               scriptLocation: inlineScript
               inlineScript: |
@@ -96,7 +100,11 @@ stages:
                 echo "$ENVS" | jq -c '.[]' | while IFS= read -r env; do
                   IFS=$'\t' read -r NAME SUB RG SERVER WS \
                     <<<"$(echo "$env" | jq -r '[.name,.subscriptionId,.resourceGroup,.sqlServer,.logAnalyticsWorkspaceId]|@tsv')"
-                  az account set --subscription "$SUB"
+                  if ! az account set --subscription "$SUB" 2>/dev/null; then
+                    echo -e "\n## [$NAME] $RG" >> "$REPORT"
+                    echo "- WARNING: subscription \`$SUB\` not accessible to this service connection - environment skipped." >> "$REPORT"
+                    continue
+                  fi
                   echo -e "\n## [$NAME] $RG" >> "$REPORT"
 
                   if [ -z "$WS" ] || [ "$WS" = "null" ]; then
@@ -171,7 +179,11 @@ stages:
                 fi
 
                 for SUB in $SUBS; do
-                  az account set --subscription "$SUB"
+                  if ! az account set --subscription "$SUB" 2>/dev/null; then
+                    echo -e "\n## Subscription $SUB" >> "$REPORT"
+                    echo "- WARNING: subscription \`$SUB\` not accessible to this service connection - skipped." >> "$REPORT"
+                    continue
+                  fi
                   echo -e "\n## Subscription $SUB" >> "$REPORT"
 
                   for V in $(az keyvault list --query "[].name" -o tsv 2>/dev/null || true); do
@@ -266,5 +278,5 @@ stages:
                 && echo "Posted card to Google Chat ($COUNT anomalies)."
             displayName: Post summary card to Google Chat (optional)
             env:
-              GCHAT_WEBHOOK_URL: $(GCHAT_WEBHOOK_URL)
+              GCHAT_WEBHOOK_URL: "https://chat.googleapis.com/v1/spaces/AAQA2Wv5Ii4/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=0QZf67KuelefwEkjhby5zxoT35dypYDl4R-KWE7zkxw"
               BUILD_URL: $(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)
