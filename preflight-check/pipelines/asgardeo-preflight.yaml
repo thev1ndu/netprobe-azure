@@ -47,7 +47,8 @@ parameters:
 
 variables:
   azureServiceConnection: $(AZURE_SERVICE_CONNECTION)   
-  agentPool: $(AGENT_POOL)                               
+  agentPool: $(AGENT_POOL)
+  gchatWebhookUrl: $(GCHAT_WEBHOOK_URL)                               
   reportFile: $(Build.ArtifactStagingDirectory)/preflight-report.md
 
 stages:
@@ -277,5 +278,5 @@ stages:
                 && echo "Posted card to Google Chat ($COUNT anomalies)."
             displayName: Notify on Google Chat
             env:
-              GCHAT_WEBHOOK_URL: $(GCHAT_WEBHOOK_URL)
+              GCHAT_WEBHOOK_URL: ${{ variables.gchatWebhookUrl }}
               BUILD_URL: $(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)
