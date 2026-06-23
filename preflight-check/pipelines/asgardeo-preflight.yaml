@@ -70,13 +70,69 @@ stages:
             displayName: Install jq
 
           - task: AzureCLI@2
+            displayName: Validate access (diagnostics)
+            continueOnError: true
+            inputs:
+              azureSubscription: thevindu-rnd-sc
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -uo pipefail
+                SUB="38785beb-5019-4896-8679-3d41ddacc4b1"
+                RG="rg-thevindu"
+                WS="e5d406b5-f761-48a7-9466-9d0d4a768f01"
+                pass() { echo "PASS: $1"; }
+                fail() { echo "FAIL: $1"; }
+
+                echo "=== Identity ==="
+                az account show --query "{sub:id, name:name, tenant:tenantId}" -o json
+
+                echo "=== Subscription set ==="
+                az account set --subscription "$SUB" && pass "az account set $SUB" || fail "az account set $SUB"
+
+                echo "=== Resource group ==="
+                az group show -n "$RG" -o tsv --query name >/dev/null 2>&1 && pass "read rg $RG" || fail "read rg $RG"
+
+                echo "=== Log Analytics query (workspace $WS) ==="
+                if az monitor log-analytics query -w "$WS" --analytics-query "print x=1" -o json 2>/tmp/la.err; then
+                  pass "log-analytics query"
+                else
+                  fail "log-analytics query"; cat /tmp/la.err
+                fi
+
+                echo "=== Key Vault list ==="
+                az keyvault list --query "[].name" -o tsv 2>/tmp/kv.err && pass "keyvault list" || { fail "keyvault list"; cat /tmp/kv.err; }
+
+                echo "=== Storage accounts ==="
+                az storage account list -g "$RG" --query "[].name" -o tsv 2>/dev/null && pass "storage list" || fail "storage list"
+
+                echo "=== Cost management ==="
+                if az costmanagement query --type ActualCost --timeframe MonthToDate \
+                     --dataset-aggregation '{"total":{"name":"Cost","function":"Sum"}}' \
+                     --scope "/subscriptions/$SUB" -o json 2>/tmp/cost.err >/dev/null; then
+                  pass "cost query"
+                else
+                  fail "cost query"; cat /tmp/cost.err
+                fi
+
+                echo "=== Secure score ==="
+                az security secure-scores list -o json 2>/dev/null >/dev/null && pass "secure score" || fail "secure score (Defender/perms)"
+
+                echo "=== Diagnostics complete (non-blocking) ==="
+
+          - task: AzureCLI@2
             displayName: Run pre-flight checks
             inputs:
               azureSubscription: thevindu-rnd-sc
               scriptType: bash
               scriptLocation: inlineScript
               inlineScript: |
-                set -euo pipefail
+                # NOTE: deliberately NOT using `set -e`. Every check below is best-effort
+                # (guarded with `|| true` / `2>/dev/null` / `// 0`); a single failing data
+                # pull must degrade that one line, not abort the whole report. `-u`/pipefail
+                # are kept. Breadcrumbs go to stderr so the console is never blank on failure.
+                set -uo pipefail
+                trap 'echo ">> last command exited $? at line $LINENO" >&2' ERR
                 REPORT="$(reportFile)"
                 LOOKBACK="${{ parameters.lookbackDays }}"
                 ERR_TH="${{ parameters.errorCountDailyThreshold }}"
@@ -105,6 +161,7 @@ stages:
                     echo "- WARNING: subscription \`$SUB\` not accessible to this service connection - environment skipped." >> "$REPORT"
                     continue
                   fi
+                  echo ">> scanning env [$NAME] rg=$RG sub=$SUB ws=${WS:-<none>}" >&2
                   echo -e "\n## [$NAME] $RG" >> "$REPORT"
 
                   if [ -z "$WS" ] || [ "$WS" = "null" ]; then
@@ -184,6 +241,7 @@ stages:
                     echo "- WARNING: subscription \`$SUB\` not accessible to this service connection - skipped." >> "$REPORT"
                     continue
                   fi
+                  echo ">> subscription-level checks for $SUB (keyvault certs, cost, secure score)" >&2
                   echo -e "\n## Subscription $SUB" >> "$REPORT"
 
                   for V in $(az keyvault list --query "[].name" -o tsv 2>/dev/null || true); do
