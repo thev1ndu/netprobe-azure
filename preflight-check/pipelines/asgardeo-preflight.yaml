@@ -39,6 +39,32 @@ parameters:
     displayName: "Flag week-over-week cost increase over N% (default 20)"
     default: 20
 
+  # ---- Anomaly-detection parameters (drive test-setup/anomaly-queries.kql) ----
+  - name: anomalySensitivity
+    type: number
+    displayName: "series_decompose_anomalies score threshold; lower = more sensitive (default 1.5)"
+    default: 1.5
+
+  - name: newErrorRecentHours
+    type: number
+    displayName: "Recent window (hours) vs baseline for new-error / spike / drop checks (default 24)"
+    default: 24
+
+  - name: tenantErrorSpikeFactor
+    type: number
+    displayName: "Flag a tenant whose recent errors exceed N x its trailing daily average (default 3)"
+    default: 3
+
+  - name: http5xxRatioPercentThreshold
+    type: number
+    displayName: "Flag any hour whose 5xx share of Frontdoor responses exceeds N% (default 5)"
+    default: 5
+
+  - name: trafficDropPercentThreshold
+    type: number
+    displayName: "Flag a tenant whose recent traffic dropped >= N% vs baseline (default 50)"
+    default: 50
+
   - name: environments
     type: object
     displayName: "Environments to scan (subscription/RG/SQL/workspace + AKS service connection)"
@@ -96,6 +122,11 @@ stages:
                 echo "=== Log Analytics query (workspace $WS) ==="
                 if az monitor log-analytics query -w "$WS" --analytics-query "print x=1" -o json 2>/tmp/la.err; then
                   pass "log-analytics query"
+                  echo "--- _CL table row counts (last 7d; 0 = data not landed yet, can take 5-15 min) ---"
+                  for T in Usage_CL FrontdoorAccessLog_CL ContainerLog_CL KubePodInventory_CL; do
+                    C=$(az monitor log-analytics query -w "$WS" --analytics-query "$T | where TimeGenerated > ago(7d) | count" -o tsv --query "[0].Count" 2>/dev/null || echo "?")
+                    echo "  $T: ${C:-0} rows"
+                  done
                 else
                   fail "log-analytics query"; cat /tmp/la.err
                 fi
@@ -140,6 +171,11 @@ stages:
                 SQL_TH="${{ parameters.sqlStorageWarnPercent }}"
                 CERT_TH="${{ parameters.certExpiryWarningDays }}"
                 COST_TH="${{ parameters.costIncreasePercentThreshold }}"
+                SENS="${{ parameters.anomalySensitivity }}"
+                RECENT_H="${{ parameters.newErrorRecentHours }}"
+                TSPIKE="${{ parameters.tenantErrorSpikeFactor }}"
+                P5XX="${{ parameters.http5xxRatioPercentThreshold }}"
+                DROP="${{ parameters.trafficDropPercentThreshold }}"
                 ENVS='${{ convertToJson(parameters.environments) }}'
                 SUBS=$(echo "$ENVS" | jq -r '[.[].subscriptionId]|unique|.[]')
 
@@ -170,29 +206,78 @@ stages:
                   if [ -n "$WS" ] && [ "$WS" != "null" ]; then
                     la() { az monitor log-analytics query -w "$WS" --analytics-query "$1" --timespan "P${LOOKBACK}D" -o json 2>/dev/null || echo '[]'; }
 
-                    ING=$(la 'Usage | summarize TotalVolumeGB = sum(Quantity/1000.) by bin(TimeGenerated, 1d) | project TotalVolumeGB | order by TotalVolumeGB asc')
+                    # NOTE: TEST queries — these read the custom `_CL` tables created by
+                    # test-setup/03-upload-sample-logs.sh (Usage_CL, FrontdoorAccessLog_CL,
+                    # ContainerLog_CL, KubePodInventory_CL). For PROD, swap back to the
+                    # built-in tables (Usage / AzureDiagnostics / ContainerLog / KubePodInventory).
+                    ING=$(la 'Usage_CL | summarize TotalVolumeGB = sum(Quantity_d / 1000.) by bin(TimeGenerated, 1d) | project TotalVolumeGB | order by TotalVolumeGB asc')
                     ING_MAX=$(echo "$ING" | jq -r '[.[].TotalVolumeGB|tonumber]|max // 0')
                     ING_AVG=$(echo "$ING" | jq -r 'if length == 0 then 0 else ([.[].TotalVolumeGB|tonumber]|add) / length end')
                     echo "- Log ingestion: peak ${ING_MAX} GB/day, avg ${ING_AVG} GB/day" >> "$REPORT"
                     awk -v mx="$ING_MAX" -v av="$ING_AVG" 'BEGIN{exit (av>0 && mx>2*av)?0:1}' \
                       && echo "  - WARNING: Peak day more than 2x the average - investigate." >> "$REPORT" || true
 
-                    FD_MAX=$(la 'AzureDiagnostics | where Category =~ "FrontdoorAccessLog" | summarize Requests=count() by bin(TimeGenerated, 1d) | project Requests' | jq -r '[.[].Requests|tonumber]|max // 0')
+                    FD_MAX=$(la 'FrontdoorAccessLog_CL | summarize Requests = count() by bin(TimeGenerated, 1d) | project Requests' | jq -r '[.[].Requests|tonumber]|max // 0')
                     echo "- Frontdoor traffic: peak ${FD_MAX} requests/day" >> "$REPORT"
 
-                    ERR_MAX=$(la 'let e=": ERROR"; ContainerLog | join kind=inner (KubePodInventory | project ContainerID, Namespace | distinct *) on ContainerID | where LogEntry has_cs e | summarize Count=count() by bin(TimeGenerated, 1d) | project Count' | jq -r '[.[].Count|tonumber]|max // 0')
+                    ERR_MAX=$(la 'ContainerLog_CL | join kind=inner (KubePodInventory_CL | project ContainerID_s, Namespace_s | distinct *) on ContainerID_s | where LogEntry_s has_cs ": ERROR" | summarize Count = count() by bin(TimeGenerated, 1d) | project Count' | jq -r '[.[].Count|tonumber]|max // 0')
                     echo "- Error count: peak ${ERR_MAX} errors/day" >> "$REPORT"
                     awk -v mx="$ERR_MAX" -v th="$ERR_TH" 'BEGIN{exit (mx>th)?0:1}' \
                       && echo "  - WARNING: Daily error count exceeded ${ERR_TH}." >> "$REPORT" || true
-                    TOPT=$(la 'let e="ERROR"; ContainerLog | join kind=inner (KubePodInventory | where Name contains "wso2is-deployment" | project ContainerID | distinct *) on ContainerID | where LogEntry has_cs e | parse LogEntry with * "Tenant: [" TenantName "]" * | where isnotempty(TenantName) | summarize LogCount=count() by TenantName | top 5 by LogCount desc' | jq -r '[.[]|"\(.TenantName)=\(.LogCount)"]|join(", ")')
+                    TOPT=$(la 'ContainerLog_CL | join kind=inner (KubePodInventory_CL | where Name_s contains "wso2is-deployment" | project ContainerID_s | distinct *) on ContainerID_s | where LogEntry_s has_cs "ERROR" | parse LogEntry_s with * "Tenant: [" TenantName "]" * | where isnotempty(TenantName) | summarize LogCount = count() by TenantName | top 5 by LogCount desc' | jq -r '[.[]|"\(.TenantName)=\(.LogCount)"]|join(", ")')
                     [ -n "$TOPT" ] && echo "  - Top error tenants: ${TOPT}" >> "$REPORT" || true
 
-                    LAT=$(la 'AzureDiagnostics | project requestUri_s, timeTaken_d | extend APICall = case(requestUri_s contains "/oauth2/token","/oauth2/token", requestUri_s contains "/oauth2/introspection","/oauth2/introspection", requestUri_s contains "/commonauth","/commonauth", requestUri_s contains "/authorize","/authorize", requestUri_s contains "/scim2","/scim2", requestUri_s contains "/api","/api","Other") | where APICall != "Other" | summarize AvgLatency = avg(todouble(timeTaken_d)) by APICall | order by AvgLatency desc')
-                    LAT_MAX=$(echo "$LAT" | jq -r '[.[].AvgLatency|tonumber]|max // 0')
-                    LAT_EP=$(echo "$LAT" | jq -r 'sort_by(.AvgLatency|tonumber)|last|.APICall // "n/a"')
-                    echo "- API latency: highest avg ${LAT_MAX}s on ${LAT_EP}" >> "$REPORT"
-                    awk -v mx="$LAT_MAX" -v th="$LAT_TH" 'BEGIN{exit (mx>th)?0:1}' \
-                      && echo "  - WARNING: Avg latency on ${LAT_EP} exceeded ${LAT_TH}s." >> "$REPORT" || true
+                    TRAF=$(la 'FrontdoorAccessLog_CL | extend reqUri = tostring(requestUri_s) | extend tenant_from_path = extract(@"/t/([^/]+)", 1, reqUri) | extend custom_domain = extract(@"https?://([^/:]+)", 1, reqUri) | extend tenant = case(isnotempty(tenant_from_path), tenant_from_path, isnotempty(custom_domain) and custom_domain !contains "asgardeo.io", custom_domain, "") | where isnotempty(tenant) | summarize request_count = count() by tenant | top 5 by request_count desc' | jq -r '[.[]|"\(.tenant)=\(.request_count)"]|join(", ")')
+                    [ -n "$TRAF" ] && echo "  - Top traffic tenants: ${TRAF}" >> "$REPORT" || true
+
+                    # ---------- Anomaly detection (test-setup/anomaly-queries.kql) ----------
+                    # Each query returns rows ONLY when anomalous, so a non-empty result is a
+                    # finding. Parameters: anomalySensitivity, newErrorRecentHours,
+                    # tenantErrorSpikeFactor, http5xxRatioPercentThreshold, trafficDropPercentThreshold.
+                    echo "- Anomaly detection (look-back ${LOOKBACK}d, recent ${RECENT_H}h, sensitivity ${SENS}):" >> "$REPORT"
+                    ANOM=0
+
+                    A=$(la "Usage_CL | make-series VolGB = sum(Quantity_d/1000.) default=0 on TimeGenerated from ago(${LOOKBACK}d) to now() step 1h | extend (flag,score,baseline)=series_decompose_anomalies(VolGB, ${SENS}) | mv-expand TimeGenerated to typeof(datetime), VolGB to typeof(double), flag to typeof(long), baseline to typeof(double) | where flag != 0 | project t=format_datetime(TimeGenerated,'MM-dd HH:mm'), v=round(VolGB,1), b=round(baseline,1), dir=iff(flag>0,'spike','drop')")
+                    if [ "$(echo "$A" | jq 'length')" -gt 0 ]; then
+                      echo "  - WARNING: Ingestion-volume anomaly: $(echo "$A" | jq -r '[.[]|"\(.t) \(.dir) \(.v)GB(base \(.b))"]|join("; ")' | cut -c1-280)" >> "$REPORT"; ANOM=1
+                    fi
+
+                    A=$(la "FrontdoorAccessLog_CL | where Category_s =~ 'FrontdoorAccessLog' | make-series Requests = count() default=0 on TimeGenerated from ago(${LOOKBACK}d) to now() step 1h | extend (flag,score,baseline)=series_decompose_anomalies(Requests, ${SENS}) | mv-expand TimeGenerated to typeof(datetime), Requests to typeof(long), flag to typeof(long), baseline to typeof(double) | where flag != 0 | project t=format_datetime(TimeGenerated,'MM-dd HH:mm'), r=Requests, b=round(baseline,0), dir=iff(flag>0,'spike','drop')")
+                    if [ "$(echo "$A" | jq 'length')" -gt 0 ]; then
+                      echo "  - WARNING: Frontdoor traffic anomaly: $(echo "$A" | jq -r '[.[]|"\(.t) \(.dir) \(.r)req(base \(.b))"]|join("; ")' | cut -c1-280)" >> "$REPORT"; ANOM=1
+                    fi
+
+                    A=$(la "ContainerLog_CL | where LogEntry_s has_cs ': ERROR' | make-series Errors = count() default=0 on TimeGenerated from ago(${LOOKBACK}d) to now() step 1h | extend (flag,score,baseline)=series_decompose_anomalies(Errors, ${SENS}) | mv-expand TimeGenerated to typeof(datetime), Errors to typeof(long), flag to typeof(long), baseline to typeof(double) | where flag > 0 | project t=format_datetime(TimeGenerated,'MM-dd HH:mm'), e=Errors, b=round(baseline,0)")
+                    if [ "$(echo "$A" | jq 'length')" -gt 0 ]; then
+                      echo "  - WARNING: Error-rate burst: $(echo "$A" | jq -r '[.[]|"\(.t) \(.e)err(base \(.b))"]|join("; ")' | cut -c1-280)" >> "$REPORT"; ANOM=1
+                    fi
+
+                    A=$(la "ContainerLog_CL | where TimeGenerated > ago(${LOOKBACK}d) | where LogEntry_s has_cs ': ERROR' | parse LogEntry_s with * ' : ERROR {' Class '}' Rest | where isnotempty(Class) | extend Signature = strcat(Class, ' |', substring(tostring(Rest), 0, 60)) | extend Window = iff(TimeGenerated > ago(${RECENT_H}h), 'recent', 'baseline') | summarize recent=countif(Window=='recent'), baseline=countif(Window=='baseline') by Signature | where baseline == 0 and recent > 0 | project Signature, recent | top 10 by recent desc")
+                    if [ "$(echo "$A" | jq 'length')" -gt 0 ]; then
+                      echo "  - WARNING: New error signature(s) in last ${RECENT_H}h: $(echo "$A" | jq -r '[.[]|"\(.Signature) (x\(.recent))"]|join("; ")' | cut -c1-280)" >> "$REPORT"; ANOM=1
+                    fi
+
+                    A=$(la "ContainerLog_CL | where TimeGenerated > ago(${LOOKBACK}d) | where LogEntry_s has_cs ': ERROR' | parse LogEntry_s with * 'Tenant: [' TenantName ']' * | where isnotempty(TenantName) | extend Window = iff(TimeGenerated > ago(${RECENT_H}h), 'recent', 'baseline') | summarize recent=countif(Window=='recent'), baselinePerDay=toreal(countif(Window=='baseline')) / ((${LOOKBACK}d - ${RECENT_H}h)/1d) by TenantName | where baselinePerDay > 0 and recent > ${TSPIKE} * baselinePerDay | project TenantName, recent, factor=round(recent/baselinePerDay,1) | top 10 by factor desc")
+                    if [ "$(echo "$A" | jq 'length')" -gt 0 ]; then
+                      echo "  - WARNING: Per-tenant error spike (>= ${TSPIKE}x baseline): $(echo "$A" | jq -r '[.[]|"\(.TenantName) x\(.factor) (\(.recent) recent)"]|join("; ")' | cut -c1-280)" >> "$REPORT"; ANOM=1
+                    fi
+
+                    A=$(la "FrontdoorAccessLog_CL | where Category_s =~ 'FrontdoorAccessLog' | where TimeGenerated > ago(${LOOKBACK}d) | extend code = toint(httpStatusCode_s) | summarize total=count(), errors=countif(code >= 500) by bin(TimeGenerated, 1h) | extend pct5xx = round(100.0*errors/total, 2) | where total > 0 and pct5xx > ${P5XX} | project t=format_datetime(TimeGenerated,'MM-dd HH:mm'), pct5xx, errors | order by t asc")
+                    if [ "$(echo "$A" | jq 'length')" -gt 0 ]; then
+                      echo "  - WARNING: HTTP 5xx ratio > ${P5XX}%: $(echo "$A" | jq -r '[.[]|"\(.t) \(.pct5xx)% (\(.errors) errs)"]|join("; ")' | cut -c1-280)" >> "$REPORT"; ANOM=1
+                    fi
+
+                    A=$(la "FrontdoorAccessLog_CL | where Category_s =~ 'FrontdoorAccessLog' | where TimeGenerated > ago(${LOOKBACK}d) | extend endpoint = extract(@'(/[^?]*)', 1, tostring(requestUri_s)) | where isnotempty(endpoint) | summarize p95=percentile(timeTaken_d, 95), n=count() by endpoint | where p95 > ${LAT_TH} | project endpoint, p95=round(p95,3), n | top 10 by p95 desc")
+                    if [ "$(echo "$A" | jq 'length')" -gt 0 ]; then
+                      echo "  - WARNING: Endpoint latency p95 > ${LAT_TH}s: $(echo "$A" | jq -r '[.[]|"\(.endpoint) \(.p95)s"]|join("; ")' | cut -c1-280)" >> "$REPORT"; ANOM=1
+                    fi
+
+                    A=$(la "FrontdoorAccessLog_CL | where Category_s =~ 'FrontdoorAccessLog' | where TimeGenerated > ago(${LOOKBACK}d) | extend reqUri = tostring(requestUri_s) | extend tenant_from_path = extract(@'/t/([^/]+)', 1, reqUri) | extend custom_domain = extract(@'https?://([^/:]+)', 1, reqUri) | extend tenant = case(isnotempty(tenant_from_path), tenant_from_path, isnotempty(custom_domain) and custom_domain !contains 'asgardeo.io', custom_domain, '') | where isnotempty(tenant) | extend Window = iff(TimeGenerated > ago(${RECENT_H}h), 'recent', 'baseline') | summarize recent=countif(Window=='recent'), baselinePerDay=toreal(countif(Window=='baseline')) / ((${LOOKBACK}d - ${RECENT_H}h)/1d) by tenant | where baselinePerDay > 0 and recent < baselinePerDay * (1 - ${DROP}/100.0) | project tenant, dropPct=round(100.0*(baselinePerDay-recent)/baselinePerDay,1) | top 10 by dropPct desc")
+                    if [ "$(echo "$A" | jq 'length')" -gt 0 ]; then
+                      echo "  - WARNING: Per-tenant traffic drop >= ${DROP}%: $(echo "$A" | jq -r '[.[]|"\(.tenant) -\(.dropPct)%"]|join("; ")' | cut -c1-280)" >> "$REPORT"; ANOM=1
+                    fi
+
+                    [ "$ANOM" -eq 0 ] && echo "  - No time-series / baseline anomalies detected." >> "$REPORT" || true
                   else
                     echo "- WARNING: No Log Analytics workspace in \`$RG\` - log checks skipped." >> "$REPORT"
                   fi

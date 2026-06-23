@@ -35,6 +35,31 @@ every subscription it can read.
 | 9 | Secure Score | `az security secure-scores`; recorded each run |
 | 10 | Archival log size | `az monitor metrics list` UsedCapacity per storage account |
 
+## Anomaly detection (self-judging queries)
+
+On top of the static threshold checks above, the pipeline runs a set of
+**anomaly-detection** queries ([`../test-setup/anomaly-queries.kql`](../test-setup/anomaly-queries.kql)).
+Each query returns rows **only when something is anomalous**, so any non-empty
+result becomes a `WARNING` line — no chart-reading required. Two techniques:
+native time-series detection (`make-series` + `series_decompose_anomalies`, which
+learns the seasonal baseline from the look-back window) and baseline-vs-recent
+comparison (last `newErrorRecentHours` vs the trailing baseline).
+
+| Check | Catches |
+|---|---|
+| Ingestion-volume anomaly | hours where GB/day deviates (spike **or** drop) from the learned baseline |
+| Frontdoor traffic anomaly | traffic spike (abuse/bot) or drop (outage/DNS/cert) per hour |
+| Error-rate burst | a short sharp error spike a daily total would dilute |
+| New error signatures | error `class\|message` seen recently but never in the baseline (regressions) |
+| Per-tenant error spike | a tenant whose recent errors ≥ `tenantErrorSpikeFactor`× its own baseline |
+| HTTP 5xx ratio | hours whose 5xx share exceeds `http5xxRatioPercentThreshold`% |
+| Endpoint latency p95 | endpoints whose p95 latency exceeds `apiLatencyThresholdSeconds` |
+| Per-tenant traffic drop | a tenant active in the baseline whose traffic fell ≥ `trafficDropPercentThreshold`% (silent per-tenant outage) |
+
+New tunable parameters (defaults in the YAML, overridable on a manual run):
+`anomalySensitivity` (1.5), `newErrorRecentHours` (24), `tenantErrorSpikeFactor`
+(3), `http5xxRatioPercentThreshold` (5), `trafficDropPercentThreshold` (50).
+
 ## What is NOT automated (dropped — needs human judgment)
 
 - Verify staging/services via **Site24x7** and triage alerts
