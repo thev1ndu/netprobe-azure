@@ -1,0 +1,255 @@
+trigger: none
+
+schedules:
+  - cron: "0 2 * * 1"
+    displayName: Weekly pre-flight (Mon 02:00 UTC)
+    branches:
+      include:
+        - main
+    always: true
+
+parameters:
+  - name: lookbackDays
+    type: number
+    default: 7
+  - name: certExpiryWarningDays
+    type: number
+    default: 30
+  - name: sqlStorageWarnPercent
+    type: number
+    default: 75
+  - name: errorCountDailyThreshold
+    type: number
+    default: 5000
+  - name: apiLatencyThresholdSeconds
+    type: number
+    default: 1.0
+  - name: costIncreasePercentThreshold
+    type: number
+    default: 20
+  - name: environments
+    type: object
+    default:
+      - name: prod-us
+        subscriptionId: ea3af8ec-73de-4e7c-870f-7a5975f7db2d
+        resourceGroup: rg-asgardeo-main-prod-eastus2-001
+        sqlServer: sql-asgardeo-main-prod-eastus2-001
+        logAnalyticsWorkspaceId: ""
+        aksName: ""
+      - name: prod-eu
+        subscriptionId: ea3af8ec-73de-4e7c-870f-7a5975f7db2d
+        resourceGroup: rg-asgardeo-main-eupr-northeurope-001
+        sqlServer: sql-asgardeo-main-eupr-northeurope-001
+        logAnalyticsWorkspaceId: ""
+        aksName: ""
+
+variables:
+  reportFile: $(Build.ArtifactStagingDirectory)/preflight-report.md
+
+stages:
+  - stage: PreFlight
+    displayName: Asgardeo Pre-Flight Check
+    jobs:
+      - job: RunChecks
+        displayName: Run automated pre-flight data pulls
+        timeoutInMinutes: 60
+        pool:
+          name: rnd-thevindu-vmss
+        steps:
+          - checkout: none
+
+          - task: AzureCLI@2
+            displayName: Run pre-flight checks
+            inputs:
+              azureSubscription: $(AZURE_SERVICE_CONNECTION)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                REPORT="$(reportFile)"
+                LOOKBACK="${{ parameters.lookbackDays }}"
+                ERR_TH="${{ parameters.errorCountDailyThreshold }}"
+                LAT_TH="${{ parameters.apiLatencyThresholdSeconds }}"
+                SQL_TH="${{ parameters.sqlStorageWarnPercent }}"
+                CERT_TH="${{ parameters.certExpiryWarningDays }}"
+                COST_TH="${{ parameters.costIncreasePercentThreshold }}"
+                ENVS='${{ convertToJson(parameters.environments) }}'
+                SUBS=$(echo "$ENVS" | jq -r '[.[].subscriptionId]|unique|.[]')
+
+                {
+                  echo "# Asgardeo Pre-Flight Check - $(date -u '+%Y-%m-%d %H:%M UTC')"
+                  echo
+                  echo "_Automated run. Look-back ${LOOKBACK}d. Anomalies flagged as WARNING; rest is informational._"
+                  echo "_Thresholds: SQL >${SQL_TH}%, error/day >${ERR_TH}, latency >${LAT_TH}s, cost WoW >${COST_TH}%, cert <${CERT_TH}d._"
+                  echo
+                  echo "> Not automated (manual on-call): Site24x7 triage, dashboard anomaly-spotting,"
+                  echo "> Defender review, GitHub/ServiceNow issue review, L1/L2 Nissan PIC checks."
+                } > "$REPORT"
+
+                echo "$ENVS" | jq -c '.[]' | while IFS= read -r env; do
+                  IFS=$'\t' read -r NAME SUB RG SERVER WS AKS \
+                    <<<"$(echo "$env" | jq -r '[.name,.subscriptionId,.resourceGroup,.sqlServer,.logAnalyticsWorkspaceId,.aksName]|@tsv')"
+                  az account set --subscription "$SUB"
+                  echo -e "\n## [$NAME] $RG" >> "$REPORT"
+
+                  if [ -z "$WS" ] || [ "$WS" = "null" ]; then
+                    WS=$(az monitor log-analytics workspace list -g "$RG" --query "[0].customerId" -o tsv 2>/dev/null || true)
+                  fi
+                  if [ -n "$WS" ] && [ "$WS" != "null" ]; then
+                    la() { az monitor log-analytics query -w "$WS" --analytics-query "$1" --timespan "P${LOOKBACK}D" -o json 2>/dev/null || echo '[]'; }
+
+                    ING=$(la 'Usage | summarize TotalVolumeGB = sum(Quantity/1000.) by bin(TimeGenerated, 1d) | project TotalVolumeGB | order by TotalVolumeGB asc')
+                    ING_MAX=$(echo "$ING" | jq -r '[.[].TotalVolumeGB|tonumber]|max // 0')
+                    ING_AVG=$(echo "$ING" | jq -r '([.[].TotalVolumeGB|tonumber]|add // 0)/((length)//1)')
+                    echo "- Log ingestion: peak ${ING_MAX} GB/day, avg ${ING_AVG} GB/day" >> "$REPORT"
+                    awk -v mx="$ING_MAX" -v av="$ING_AVG" 'BEGIN{exit (av>0 && mx>2*av)?0:1}' \
+                      && echo "  - WARNING: Peak day more than 2x the average - investigate." >> "$REPORT" || true
+
+                    FD_MAX=$(la 'AzureDiagnostics | where Category =~ "FrontdoorAccessLog" | summarize Requests=count() by bin(TimeGenerated, 1d) | project Requests' | jq -r '[.[].Requests|tonumber]|max // 0')
+                    echo "- Frontdoor traffic: peak ${FD_MAX} requests/day" >> "$REPORT"
+
+                    ERR_MAX=$(la 'let e=": ERROR"; ContainerLog | join kind=inner (KubePodInventory | project ContainerID, Namespace | distinct *) on ContainerID | where LogEntry has_cs e | summarize Count=count() by bin(TimeGenerated, 1d) | project Count' | jq -r '[.[].Count|tonumber]|max // 0')
+                    echo "- Error count: peak ${ERR_MAX} errors/day" >> "$REPORT"
+                    awk -v mx="$ERR_MAX" -v th="$ERR_TH" 'BEGIN{exit (mx>th)?0:1}' \
+                      && echo "  - WARNING: Daily error count exceeded ${ERR_TH}." >> "$REPORT" || true
+                    TOPT=$(la 'let e="ERROR"; ContainerLog | join kind=inner (KubePodInventory | where Name contains "wso2is-deployment" | project ContainerID | distinct *) on ContainerID | where LogEntry has_cs e | parse LogEntry with * "Tenant: [" TenantName "]" * | where isnotempty(TenantName) | summarize LogCount=count() by TenantName | top 5 by LogCount desc' | jq -r '[.[]|"\(.TenantName)=\(.LogCount)"]|join(", ")')
+                    [ -n "$TOPT" ] && echo "  - Top error tenants: ${TOPT}" >> "$REPORT" || true
+
+                    LAT=$(la 'AzureDiagnostics | project requestUri_s, timeTaken_d | extend APICall = case(requestUri_s contains "/oauth2/token","/oauth2/token", requestUri_s contains "/oauth2/introspection","/oauth2/introspection", requestUri_s contains "/commonauth","/commonauth", requestUri_s contains "/authorize","/authorize", requestUri_s contains "/scim2","/scim2", requestUri_s contains "/api","/api","Other") | where APICall != "Other" | summarize AvgLatency = avg(todouble(timeTaken_d)) by APICall | order by AvgLatency desc')
+                    LAT_MAX=$(echo "$LAT" | jq -r '[.[].AvgLatency|tonumber]|max // 0')
+                    LAT_EP=$(echo "$LAT" | jq -r 'sort_by(.AvgLatency|tonumber)|last|.APICall // "n/a"')
+                    echo "- API latency: highest avg ${LAT_MAX}s on ${LAT_EP}" >> "$REPORT"
+                    awk -v mx="$LAT_MAX" -v th="$LAT_TH" 'BEGIN{exit (mx>th)?0:1}' \
+                      && echo "  - WARNING: Avg latency on ${LAT_EP} exceeded ${LAT_TH}s." >> "$REPORT" || true
+                  else
+                    echo "- WARNING: No Log Analytics workspace in \`$RG\` - log checks skipped." >> "$REPORT"
+                  fi
+
+                  DBS=$(az sql db list -g "$RG" -s "$SERVER" --query "[?name!='master'].name" -o tsv 2>/dev/null || true)
+                  if [ -z "$DBS" ]; then
+                    echo "- WARNING: No databases found on \`$SERVER\`." >> "$REPORT"
+                  else
+                    for DB in $DBS; do
+                      USAGE=$(az sql db list-usages -g "$RG" -s "$SERVER" -n "$DB" -o json 2>/dev/null || echo '[]')
+                      CUR=$(echo "$USAGE" | jq -r '.[]|select(.displayName=="Database Size" or .name=="database_size")|.currentValue' | head -1)
+                      LIM=$(echo "$USAGE" | jq -r '.[]|select(.displayName=="Database Size" or .name=="database_size")|.limit' | head -1)
+                      if [ -n "${CUR:-}" ] && [ -n "${LIM:-}" ] && [ "$LIM" != "0" ] && [ "$LIM" != "null" ]; then
+                        PCT=$(awk -v c="$CUR" -v l="$LIM" 'BEGIN{printf "%.1f",(c/l)*100}')
+                        if awk -v p="$PCT" -v w="$SQL_TH" 'BEGIN{exit (p>w)?0:1}'; then
+                          echo "- WARNING: DB ${DB}: ${PCT}% used - UNSAFE (over ${SQL_TH}%)" >> "$REPORT"
+                        else
+                          echo "- DB ${DB}: ${PCT}% used" >> "$REPORT"
+                        fi
+                      else
+                        echo "- DB ${DB}: usage unavailable" >> "$REPORT"
+                      fi
+                    done
+                  fi
+
+                  if [ -z "$AKS" ] || [ "$AKS" = "null" ]; then
+                    AKS=$(az aks list -g "$RG" --query "[0].name" -o tsv 2>/dev/null || true)
+                  fi
+                  if [ -z "$AKS" ] || [ "$AKS" = "null" ]; then
+                    echo "- WARNING: No AKS cluster in \`$RG\` - pod/node check skipped." >> "$REPORT"
+                  else
+                    BAD=$(az aks command invoke -g "$RG" -n "$AKS" --command "kubectl get pods -A --no-headers | grep -Ev 'Running|Completed' || true" -o tsv 2>/dev/null | grep -Ev '^command (started|finished)' | sed '/^[[:space:]]*$/d' || true)
+                    if [ -n "$BAD" ]; then
+                      echo "- WARNING: Pods not Running/Completed on ${AKS}:" >> "$REPORT"
+                      printf '```\n%s\n```\n' "$BAD" >> "$REPORT"
+                    else
+                      echo "- All pods Running/Completed on ${AKS}." >> "$REPORT"
+                    fi
+                    TOP=$(az aks command invoke -g "$RG" -n "$AKS" --command "kubectl top nodes --no-headers || true" -o tsv 2>/dev/null | grep -v '^command' | sed '/^[[:space:]]*$/d' || true)
+                    [ -n "$TOP" ] && printf -- '- Node utilisation (name / CPU%% / mem%%):\n```\n%s\n```\n' "$TOP" >> "$REPORT" || true
+                  fi
+
+                  for SAID in $(az storage account list -g "$RG" --query "[].id" -o tsv 2>/dev/null || true); do
+                    BYTES=$(az monitor metrics list --resource "$SAID" --metric UsedCapacity --interval PT1H --query "value[0].timeseries[0].data[-1].average" -o tsv 2>/dev/null || echo "")
+                    if [ -n "${BYTES:-}" ] && [ "$BYTES" != "None" ]; then
+                      echo "- Archival ${SAID##*/}: $(awk -v b="$BYTES" 'BEGIN{printf "%.2f",b/1073741824}') GiB used" >> "$REPORT"
+                    fi
+                  done
+                done
+
+                NOW=$(date -u +%s)
+                if date -u -d "yesterday" +%F >/dev/null 2>&1; then
+                  TO=$(date -u -d "yesterday" +%F); FROM=$(date -u -d "8 days ago" +%F)
+                  PTO=$(date -u -d "8 days ago" +%F); PFROM=$(date -u -d "15 days ago" +%F)
+                else
+                  TO=$(date -u -v-1d +%F); FROM=$(date -u -v-8d +%F)
+                  PTO=$(date -u -v-8d +%F); PFROM=$(date -u -v-15d +%F)
+                fi
+
+                for SUB in $SUBS; do
+                  az account set --subscription "$SUB"
+                  echo -e "\n## Subscription $SUB" >> "$REPORT"
+
+                  for V in $(az keyvault list --query "[].name" -o tsv 2>/dev/null || true); do
+                    az keyvault certificate list --vault-name "$V" --query "[].{name:name,exp:attributes.expires}" -o json 2>/dev/null | jq -c '.[]' | while read -r cert; do
+                      CN=$(echo "$cert" | jq -r '.name'); EXP=$(echo "$cert" | jq -r '.exp')
+                      [ "$EXP" = "null" ] && continue
+                      EXP_S=$(date -u -d "$EXP" +%s 2>/dev/null || date -u -j -f "%Y-%m-%dT%H:%M:%S+00:00" "${EXP%%.*}+00:00" +%s 2>/dev/null || echo 0)
+                      [ "$EXP_S" = "0" ] && continue
+                      DAYS=$(( (EXP_S - NOW) / 86400 ))
+                      if [ "$DAYS" -lt 0 ]; then
+                        echo "- WARNING: EXPIRED cert ${V}/${CN} ($(( -DAYS ))d ago, ${EXP%%T*})" >> "$REPORT"
+                      elif [ "$DAYS" -lt "$CERT_TH" ]; then
+                        echo "- WARNING: cert ${V}/${CN} expires in ${DAYS}d (${EXP%%T*})" >> "$REPORT"
+                      fi
+                    done
+                  done
+
+                  cost() { az costmanagement query --type ActualCost --timeframe Custom --time-period from="$1" to="$2" --dataset-granularity None --dataset-aggregation '{"total":{"name":"Cost","function":"Sum"}}' --scope "/subscriptions/$SUB" --query "properties.rows[0][0]" -o tsv 2>/dev/null || echo 0; }
+                  THIS=$(cost "$FROM" "$TO"); PREV=$(cost "$PFROM" "$PTO"); THIS=${THIS:-0}; PREV=${PREV:-0}
+                  echo "- Cost: this week (${FROM}..${TO}) \$$(printf '%.2f' "$THIS") | prior \$$(printf '%.2f' "$PREV")" >> "$REPORT"
+                  awk -v t="$THIS" -v p="$PREV" -v th="$COST_TH" 'BEGIN{exit (p>0 && ((t-p)/p*100)>th)?0:1}' \
+                    && echo "  - WARNING: Cost up $(awk -v t="$THIS" -v p="$PREV" 'BEGIN{printf "%.1f",(t-p)/p*100}')% week-over-week." >> "$REPORT" || true
+
+                  SCORE=$(az security secure-scores show --name ascScore -o json 2>/dev/null || az security secure-scores list -o json 2>/dev/null | jq '.[0]' || echo '{}')
+                  PCT=$(echo "$SCORE" | jq -r '.score.percentage // .properties.score.percentage // empty')
+                  if [ -n "${PCT:-}" ]; then
+                    echo "- Secure score: $(awk -v p="$PCT" 'BEGIN{printf "%.0f",p*100}')%" >> "$REPORT"
+                  else
+                    echo "- Secure score: unavailable (Defender plan / permissions)." >> "$REPORT"
+                  fi
+                done
+
+                echo "===== CONSOLIDATED PRE-FLIGHT REPORT ====="
+                cat "$REPORT"
+
+          - publish: $(reportFile)
+            artifact: preflight-report
+            displayName: Publish report artifact
+
+          - bash: |
+              set -euo pipefail
+              [ -z "${GCHAT_WEBHOOK_URL:-}" ] && { echo "GCHAT_WEBHOOK_URL not set - skipping."; exit 0; }
+              ANOMALIES=$(grep "WARNING:" "$(reportFile)" | sed -E 's/^[[:space:]]*-?[[:space:]]*WARNING:[[:space:]]*//' || true)
+              COUNT=$(printf '%s\n' "$ANOMALIES" | grep -c . || true)
+
+              if [ "$COUNT" -eq 0 ]; then
+                SECTION=$(jq -n '{header:"Status",widgets:[{decoratedText:{startIcon:{materialIcon:{name:"check_circle"}},text:"<b>No anomalies detected this week.</b>"}}]}')
+                SUB="No anomalies"
+              else
+                SECTION=$(printf '%s' "$ANOMALIES" | jq -R -s --arg c "$COUNT" '
+                  {header:("Anomalies ("+$c+")"),
+                   widgets:(split("\n")|map(select(length>0))[:30]
+                            |map({decoratedText:{startIcon:{materialIcon:{name:"warning"}},text:.}}))}')
+                SUB="$COUNT anomaly(ies) detected"
+              fi
+
+              CARD=$(jq -n --arg sub "$SUB" --arg ts "$(date -u '+%Y-%m-%d %H:%M UTC')" \
+                --arg url "${BUILD_URL:-}" --argjson section "$SECTION" '
+                {cardsV2:[{cardId:"asgardeo-preflight",card:{
+                  header:{title:"Asgardeo Preflight Check",subtitle:($ts+"  |  "+$sub),
+                          imageType:"CIRCLE",imageUrl:"https://wso2.cachefly.net/wso2/sites/all/image_resources/asgardeo-logo-deverloper-page.webp"},
+                  sections:[ $section,
+                    {widgets:[{buttonList:{buttons:[{text:"Open pipeline run",
+                       onClick:{openLink:{url:$url}}}]}}]} ]}}]}')
+
+              curl -sS -H "Content-Type: application/json" -d "$CARD" "$GCHAT_WEBHOOK_URL" >/dev/null \
+                && echo "Posted card to Google Chat ($COUNT anomalies)."
+            displayName: Post summary card to Google Chat (optional)
+            env:
+              GCHAT_WEBHOOK_URL: $(GCHAT_WEBHOOK_URL)
+              BUILD_URL: $(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)
