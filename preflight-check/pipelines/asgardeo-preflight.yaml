@@ -9,76 +9,52 @@ schedules:
     always: true
 
 parameters:
-  # Trailing time window every log/metric check looks at, in days. Drives the
-  # Log Analytics timespan (P{n}D) for ingestion, frontdoor, error-count and
-  # latency queries. 7 = "since the last weekly run"; larger = more history
-  # but heavier/slower KQL.
   - name: lookbackDays
     type: number
     displayName: "Look-back window in days for all log/metric queries (default 7 = last week)"
     default: 7
 
-  # Certificate-expiry warning horizon, in days. Any Key Vault certificate
-  # expiring sooner than this is flagged as an anomaly so it can be rotated in
-  # time. Raise for earlier notice; lower for less noise.
   - name: certExpiryWarningDays
     type: number
     displayName: "Flag Key Vault certificates expiring within N days (default 30)"
     default: 30
 
-  # SQL database storage ceiling, in percent of the database's max size. A DB
-  # whose used space exceeds this is flagged UNSAFE (ports the 75 argument from
-  # the team's checkAzureSqlDbStorage.sh).
   - name: sqlStorageWarnPercent
     type: number
     displayName: "Flag SQL databases over N% storage used (default 75)"
     default: 75
 
-  # Per-day error-count ceiling from the ContainerLog ': ERROR' query. If the
-  # peak day in the window exceeds this it is flagged. Set to the normal daily
-  # baseline plus headroom (~2000-2500/day is typical per the record sheet).
   - name: errorCountDailyThreshold
     type: number
     displayName: "Flag if any single day's IS error count exceeds N (default 5000)"
     default: 5000
 
-  # Average API latency ceiling, in seconds, per endpoint group (/oauth2/token,
-  # /scim2, /authorize, ...). The slowest endpoint's average over the window is
-  # compared against this; SCIM2 has historically spiked around 1s.
   - name: apiLatencyThresholdSeconds
     type: number
     displayName: "Flag API endpoints whose avg latency exceeds N seconds (default 1.0)"
     default: 1.0
 
-  # Week-over-week cost increase ceiling, in percent. Compares the last 7 days
-  # of spend against the prior 7 days per subscription (Cost Management API) and
-  # flags if the rise exceeds this. Catches runaway/anomalous spend.
   - name: costIncreasePercentThreshold
     type: number
     displayName: "Flag week-over-week cost increase over N% (default 20)"
     default: 20
 
-  # Environments to sweep, as a JSON array string (editable in the Run dialog;
-  # ADO has no "json" param type, so this is a string parsed with jq). Each
-  # object is one region/deployment. Fields:
-  #   name                    - label shown in the report heading
-  #   subscriptionId          - subscription the resources live in; the ARM
-  #                             service connection must be able to read it
-  #   resourceGroup           - RG scanned for Log Analytics, SQL, AKS, storage
-  #   sqlServer               - logical SQL server whose databases are checked
-  #   logAnalyticsWorkspaceId - workspace GUID (customerId) for KQL; leave ""
-  #                             to auto-discover the first workspace in the RG
-  #   aksName                 - AKS cluster for pod/node checks; leave "" to
-  #                             auto-discover the first cluster in the RG
-  # Cert/cost/secure-score run once per UNIQUE subscriptionId in this list.
   - name: environments
-    type: string
-    displayName: "Environments to scan, JSON array (subscription/RG/SQL/workspace/AKS)"
-    default: >-
-      [
-      {"name": "prod-us", "subscriptionId": "ea3af8ec-73de-4e7c-870f-7a5975f7db2d", "resourceGroup": "rg-asgardeo-main-prod-eastus2-001", "sqlServer": "sql-asgardeo-main-prod-eastus2-001", "logAnalyticsWorkspaceId": "", "aksName": ""},
-      {"name": "prod-eu", "subscriptionId": "ea3af8ec-73de-4e7c-870f-7a5975f7db2d", "resourceGroup": "rg-asgardeo-main-eupr-northeurope-001", "sqlServer": "sql-asgardeo-main-eupr-northeurope-001", "logAnalyticsWorkspaceId": "", "aksName": ""}
-      ]
+    type: object
+    displayName: "Environments to scan (subscription/RG/SQL/workspace + AKS service connection)"
+    default:
+      - name: prod-us
+        subscriptionId: ea3af8ec-73de-4e7c-870f-7a5975f7db2d
+        resourceGroup: rg-asgardeo-main-prod-eastus2-001
+        sqlServer: sql-asgardeo-main-prod-eastus2-001
+        logAnalyticsWorkspaceId: ""
+        aksServiceConnection: ""
+      - name: prod-eu
+        subscriptionId: ea3af8ec-73de-4e7c-870f-7a5975f7db2d
+        resourceGroup: rg-asgardeo-main-eupr-northeurope-001
+        sqlServer: sql-asgardeo-main-eupr-northeurope-001
+        logAnalyticsWorkspaceId: ""
+        aksServiceConnection: ""
 
 variables:
   reportFile: $(Build.ArtifactStagingDirectory)/preflight-report.md
@@ -110,7 +86,7 @@ stages:
                 SQL_TH="${{ parameters.sqlStorageWarnPercent }}"
                 CERT_TH="${{ parameters.certExpiryWarningDays }}"
                 COST_TH="${{ parameters.costIncreasePercentThreshold }}"
-                ENVS='${{ parameters.environments }}'
+                ENVS='${{ convertToJson(parameters.environments) }}'
                 SUBS=$(echo "$ENVS" | jq -r '[.[].subscriptionId]|unique|.[]')
 
                 {
@@ -124,8 +100,8 @@ stages:
                 } > "$REPORT"
 
                 echo "$ENVS" | jq -c '.[]' | while IFS= read -r env; do
-                  IFS=$'\t' read -r NAME SUB RG SERVER WS AKS \
-                    <<<"$(echo "$env" | jq -r '[.name,.subscriptionId,.resourceGroup,.sqlServer,.logAnalyticsWorkspaceId,.aksName]|@tsv')"
+                  IFS=$'\t' read -r NAME SUB RG SERVER WS \
+                    <<<"$(echo "$env" | jq -r '[.name,.subscriptionId,.resourceGroup,.sqlServer,.logAnalyticsWorkspaceId]|@tsv')"
                   az account set --subscription "$SUB"
                   echo -e "\n## [$NAME] $RG" >> "$REPORT"
 
@@ -168,36 +144,19 @@ stages:
                   else
                     for DB in $DBS; do
                       USAGE=$(az sql db list-usages -g "$RG" -s "$SERVER" -n "$DB" -o json 2>/dev/null || echo '[]')
-                      CUR=$(echo "$USAGE" | jq -r '.[]|select(.displayName=="Database Size" or .name=="database_size")|.currentValue' | head -1)
-                      LIM=$(echo "$USAGE" | jq -r '.[]|select(.displayName=="Database Size" or .name=="database_size")|.limit' | head -1)
-                      if [ -n "${CUR:-}" ] && [ -n "${LIM:-}" ] && [ "$LIM" != "0" ] && [ "$LIM" != "null" ]; then
-                        PCT=$(awk -v c="$CUR" -v l="$LIM" 'BEGIN{printf "%.1f",(c/l)*100}')
-                        if awk -v p="$PCT" -v w="$SQL_TH" 'BEGIN{exit (p>w)?0:1}'; then
-                          echo "- WARNING: DB ${DB}: ${PCT}% used - UNSAFE (over ${SQL_TH}%)" >> "$REPORT"
+                      USED_BYTES=$(echo "$USAGE" | jq -r '.[]|select(.name=="database_size")|.currentValue' | head -1)
+                      MAX_BYTES=$(echo "$USAGE" | jq -r '.[]|select(.name=="database_size")|.limit' | head -1)
+                      if [ -n "${USED_BYTES:-}" ] && [ "$USED_BYTES" != "null" ] && [ -n "${MAX_BYTES:-}" ] && [ "$MAX_BYTES" != "0" ] && [ "$MAX_BYTES" != "null" ]; then
+                        read -r MAX_GB USED_PCT FREE_PCT <<<"$(awk -v u="$USED_BYTES" -v m="$MAX_BYTES" 'BEGIN{printf "%.2f %.2f %.2f", m/(1024^3), (u/m)*100, 100-(u/m)*100}')"
+                        if awk -v p="$USED_PCT" -v t="$SQL_TH" 'BEGIN{exit (p<t)?0:1}'; then
+                          echo "- DB ${DB}: ${MAX_GB} GB max, ${USED_PCT}% used, ${FREE_PCT}% free - SAFE" >> "$REPORT"
                         else
-                          echo "- DB ${DB}: ${PCT}% used" >> "$REPORT"
+                          echo "- WARNING: DB ${DB}: ${MAX_GB} GB max, ${USED_PCT}% used, ${FREE_PCT}% free - ALERT (>= ${SQL_TH}%)" >> "$REPORT"
                         fi
                       else
                         echo "- DB ${DB}: usage unavailable" >> "$REPORT"
                       fi
                     done
-                  fi
-
-                  if [ -z "$AKS" ] || [ "$AKS" = "null" ]; then
-                    AKS=$(az aks list -g "$RG" --query "[0].name" -o tsv 2>/dev/null || true)
-                  fi
-                  if [ -z "$AKS" ] || [ "$AKS" = "null" ]; then
-                    echo "- WARNING: No AKS cluster in \`$RG\` - pod/node check skipped." >> "$REPORT"
-                  else
-                    BAD=$(az aks command invoke -g "$RG" -n "$AKS" --command "kubectl get pods -A --no-headers | grep -Ev 'Running|Completed' || true" -o tsv 2>/dev/null | grep -Ev '^command (started|finished)' | sed '/^[[:space:]]*$/d' || true)
-                    if [ -n "$BAD" ]; then
-                      echo "- WARNING: Pods not Running/Completed on ${AKS}:" >> "$REPORT"
-                      printf '```\n%s\n```\n' "$BAD" >> "$REPORT"
-                    else
-                      echo "- All pods Running/Completed on ${AKS}." >> "$REPORT"
-                    fi
-                    TOP=$(az aks command invoke -g "$RG" -n "$AKS" --command "kubectl top nodes --no-headers || true" -o tsv 2>/dev/null | grep -v '^command' | sed '/^[[:space:]]*$/d' || true)
-                    [ -n "$TOP" ] && printf -- '- Node utilisation (name / CPU%% / mem%%):\n```\n%s\n```\n' "$TOP" >> "$REPORT" || true
                   fi
 
                   for SAID in $(az storage account list -g "$RG" --query "[].id" -o tsv 2>/dev/null || true); do
@@ -251,8 +210,33 @@ stages:
                   fi
                 done
 
-                echo "===== CONSOLIDATED PRE-FLIGHT REPORT ====="
-                cat "$REPORT"
+          - ${{ each env in parameters.environments }}:
+            - ${{ if ne(env.aksServiceConnection, '') }}:
+              - task: Kubernetes@1
+                displayName: AKS login [${{ env.name }}]
+                inputs:
+                  connectionType: Kubernetes Service Connection
+                  kubernetesServiceEndpoint: ${{ env.aksServiceConnection }}
+                  command: login
+              - bash: |
+                  set -euo pipefail
+                  REPORT="$(reportFile)"
+                  echo -e "\n## AKS [${{ env.name }}]" >> "$REPORT"
+                  BAD=$(kubectl get pods -A --no-headers 2>/dev/null | grep -Ev 'Running|Completed' || true)
+                  if [ -n "$BAD" ]; then
+                    echo "- WARNING: Pods not Running/Completed:" >> "$REPORT"
+                    printf '```\n%s\n```\n' "$BAD" >> "$REPORT"
+                  else
+                    echo "- All pods Running/Completed." >> "$REPORT"
+                  fi
+                  TOP=$(kubectl top nodes --no-headers 2>/dev/null || true)
+                  [ -n "$TOP" ] && printf -- '- Node utilisation (name / CPU%% / mem%%):\n```\n%s\n```\n' "$TOP" >> "$REPORT" || true
+                displayName: AKS pod/node check [${{ env.name }}]
+
+          - bash: |
+              echo "===== CONSOLIDATED PRE-FLIGHT REPORT ====="
+              cat "$(reportFile)"
+            displayName: Print consolidated report
 
           - publish: $(reportFile)
             artifact: preflight-report
