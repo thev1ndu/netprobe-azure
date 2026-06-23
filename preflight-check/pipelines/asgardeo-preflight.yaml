@@ -9,26 +9,69 @@ schedules:
     always: true
 
 parameters:
+  # Trailing time window every log/metric check looks at, in days. Drives the
+  # Log Analytics timespan (P{n}D) for ingestion, frontdoor, error-count and
+  # latency queries. 7 = "since the last weekly run"; larger = more history
+  # but heavier/slower KQL.
   - name: lookbackDays
     type: number
+    displayName: "Look-back window in days for all log/metric queries (default 7 = last week)"
     default: 7
+
+  # Certificate-expiry warning horizon, in days. Any Key Vault certificate
+  # expiring sooner than this is flagged as an anomaly so it can be rotated in
+  # time. Raise for earlier notice; lower for less noise.
   - name: certExpiryWarningDays
     type: number
+    displayName: "Flag Key Vault certificates expiring within N days (default 30)"
     default: 30
+
+  # SQL database storage ceiling, in percent of the database's max size. A DB
+  # whose used space exceeds this is flagged UNSAFE (ports the 75 argument from
+  # the team's checkAzureSqlDbStorage.sh).
   - name: sqlStorageWarnPercent
     type: number
+    displayName: "Flag SQL databases over N% storage used (default 75)"
     default: 75
+
+  # Per-day error-count ceiling from the ContainerLog ': ERROR' query. If the
+  # peak day in the window exceeds this it is flagged. Set to the normal daily
+  # baseline plus headroom (~2000-2500/day is typical per the record sheet).
   - name: errorCountDailyThreshold
     type: number
+    displayName: "Flag if any single day's IS error count exceeds N (default 5000)"
     default: 5000
+
+  # Average API latency ceiling, in seconds, per endpoint group (/oauth2/token,
+  # /scim2, /authorize, ...). The slowest endpoint's average over the window is
+  # compared against this; SCIM2 has historically spiked around 1s.
   - name: apiLatencyThresholdSeconds
     type: number
+    displayName: "Flag API endpoints whose avg latency exceeds N seconds (default 1.0)"
     default: 1.0
+
+  # Week-over-week cost increase ceiling, in percent. Compares the last 7 days
+  # of spend against the prior 7 days per subscription (Cost Management API) and
+  # flags if the rise exceeds this. Catches runaway/anomalous spend.
   - name: costIncreasePercentThreshold
     type: number
+    displayName: "Flag week-over-week cost increase over N% (default 20)"
     default: 20
+
+  # Environments to sweep; each entry is one region/deployment. Fields:
+  #   name                    - label shown in the report heading
+  #   subscriptionId          - subscription the resources live in; the ARM
+  #                             service connection must be able to read it
+  #   resourceGroup           - RG scanned for Log Analytics, SQL, AKS, storage
+  #   sqlServer               - logical SQL server whose databases are checked
+  #   logAnalyticsWorkspaceId - workspace GUID (customerId) for KQL; leave ""
+  #                             to auto-discover the first workspace in the RG
+  #   aksName                 - AKS cluster for pod/node checks; leave "" to
+  #                             auto-discover the first cluster in the RG
+  # Cert/cost/secure-score run once per UNIQUE subscriptionId in this list.
   - name: environments
     type: object
+    displayName: "Environments to scan (region -> subscription/RG/SQL/workspace/AKS)"
     default:
       - name: prod-us
         subscriptionId: ea3af8ec-73de-4e7c-870f-7a5975f7db2d
