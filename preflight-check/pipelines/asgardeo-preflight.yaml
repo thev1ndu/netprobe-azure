@@ -107,7 +107,7 @@ stages:
 
                     ING=$(la 'Usage | summarize TotalVolumeGB = sum(Quantity/1000.) by bin(TimeGenerated, 1d) | project TotalVolumeGB | order by TotalVolumeGB asc')
                     ING_MAX=$(echo "$ING" | jq -r '[.[].TotalVolumeGB|tonumber]|max // 0')
-                    ING_AVG=$(echo "$ING" | jq -r '([.[].TotalVolumeGB|tonumber]|add // 0)/((length)//1)')
+                    ING_AVG=$(echo "$ING" | jq -r 'if length == 0 then 0 else ([.[].TotalVolumeGB|tonumber]|add) / length end')
                     echo "- Log ingestion: peak ${ING_MAX} GB/day, avg ${ING_AVG} GB/day" >> "$REPORT"
                     awk -v mx="$ING_MAX" -v av="$ING_AVG" 'BEGIN{exit (av>0 && mx>2*av)?0:1}' \
                       && echo "  - WARNING: Peak day more than 2x the average - investigate." >> "$REPORT" || true
