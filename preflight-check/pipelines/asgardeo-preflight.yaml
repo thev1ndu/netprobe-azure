@@ -401,6 +401,42 @@ stages:
             artifact: preflight-report
             displayName: Publish report artifact
 
+          - task: AzureCLI@2
+            displayName: Upload report to Azure Files (sa18436)
+            condition: always()
+            inputs:
+              azureSubscription: $(AZURE_SERVICE_CONNECTION)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                STORAGE_ACCOUNT="sa18436"
+                RESOURCE_GROUP="rg-thevindu"
+                SHARE_NAME="fileshare"
+                DEST_DIR="dumps"
+
+                if [ ! -f "$(reportFile)" ]; then
+                  echo "No report file at $(reportFile) - nothing to upload."
+                  exit 0
+                fi
+
+                DEST_NAME="preflight-report-$(date -u '+%Y-%m-%d-%H%M').md"
+
+                # Azure Files (SMB) data-plane needs the account key (or a SAS);
+                # the SP running this connection must be allowed to list keys.
+                ACCOUNT_KEY=$(az storage account keys list \
+                  --account-name "$STORAGE_ACCOUNT" -g "$RESOURCE_GROUP" \
+                  --query "[0].value" -o tsv)
+
+                az storage file upload \
+                  --account-name "$STORAGE_ACCOUNT" \
+                  --account-key "$ACCOUNT_KEY" \
+                  --share-name "$SHARE_NAME" \
+                  --source "$(reportFile)" \
+                  --path "${DEST_DIR}/${DEST_NAME}"
+
+                echo "Uploaded report to ${STORAGE_ACCOUNT}/${SHARE_NAME}/${DEST_DIR}/${DEST_NAME}"
+
           - bash: |
               set -euo pipefail
 
