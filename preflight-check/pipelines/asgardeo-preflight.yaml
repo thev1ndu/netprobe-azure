@@ -249,31 +249,39 @@ stages:
                     echo "- WARNING: No Log Analytics workspace in \`$RESOURCE_GROUP\` - log checks skipped." >> "$REPORT"
                   fi
 
-                  DATABASE_NAMES=$(az sql db list -g "$RESOURCE_GROUP" -s "$SQL_SERVER" --query "[?name!='master'].name" -o tsv 2>/dev/null || true)
-                  if [ -z "$DATABASE_NAMES" ]; then
-                    echo "- WARNING: No databases found on \`$SQL_SERVER\`." >> "$REPORT"
+                  if [ -z "${SQL_SERVER:-}" ] || [ "$SQL_SERVER" = "null" ]; then
+                    echo "- SQL: not configured for this environment - skipped." >> "$REPORT"
                   else
-                    for DATABASE_NAME in $DATABASE_NAMES; do
-                      DATABASE_USAGE_JSON=$(az sql db list-usages -g "$RESOURCE_GROUP" -s "$SQL_SERVER" -n "$DATABASE_NAME" -o json 2>/dev/null || echo '[]')
-                      USED_BYTES=$(echo "$DATABASE_USAGE_JSON" | jq -r '.[]|select(.name=="database_size")|.currentValue' | head -1)
-                      MAX_BYTES=$(echo "$DATABASE_USAGE_JSON" | jq -r '.[]|select(.name=="database_size")|.limit' | head -1)
-                      if [ -n "${USED_BYTES:-}" ] && [ "$USED_BYTES" != "null" ] && [ -n "${MAX_BYTES:-}" ] && [ "$MAX_BYTES" != "0" ] && [ "$MAX_BYTES" != "null" ]; then
-                        read -r max_size_gb used_percent free_percent <<<"$(awk -v used="$USED_BYTES" -v max="$MAX_BYTES" \
-                          'BEGIN{printf "%.2f %.2f %.2f", max/(1024^3), (used/max)*100, 100-(used/max)*100}')"
-                        if awk -v used_pct="$used_percent" -v warn_pct="$SQL_STORAGE_WARN_PERCENT" \
-                          'BEGIN{exit (used_pct<warn_pct)?0:1}'; then
-                          echo "- DB ${DATABASE_NAME}: ${max_size_gb} GB max, ${used_percent}% used, ${free_percent}% free - SAFE" >> "$REPORT"
+                    DATABASE_NAMES=$(az sql db list -g "$RESOURCE_GROUP" -s "$SQL_SERVER" --query "[?name!='master'].name" -o tsv 2>/dev/null || true)
+                    if [ -z "$DATABASE_NAMES" ]; then
+                      echo "- WARNING: No databases found on \`$SQL_SERVER\`." >> "$REPORT"
+                    else
+                      for DATABASE_NAME in $DATABASE_NAMES; do
+                        DATABASE_USAGE_JSON=$(az sql db list-usages -g "$RESOURCE_GROUP" -s "$SQL_SERVER" -n "$DATABASE_NAME" -o json 2>/dev/null || echo '[]')
+                        USED_BYTES=$(echo "$DATABASE_USAGE_JSON" | jq -r '.[]|select(.name=="database_size")|.currentValue' | head -1)
+                        MAX_BYTES=$(echo "$DATABASE_USAGE_JSON" | jq -r '.[]|select(.name=="database_size")|.limit' | head -1)
+                        if [ -n "${USED_BYTES:-}" ] && [ "$USED_BYTES" != "null" ] && [ -n "${MAX_BYTES:-}" ] && [ "$MAX_BYTES" != "0" ] && [ "$MAX_BYTES" != "null" ]; then
+                          read -r max_size_gb used_percent free_percent <<<"$(awk -v used="$USED_BYTES" -v max="$MAX_BYTES" \
+                            'BEGIN{printf "%.2f %.2f %.2f", max/(1024^3), (used/max)*100, 100-(used/max)*100}')"
+                          if awk -v used_pct="$used_percent" -v warn_pct="$SQL_STORAGE_WARN_PERCENT" \
+                            'BEGIN{exit (used_pct<warn_pct)?0:1}'; then
+                            echo "- DB ${DATABASE_NAME}: ${max_size_gb} GB max, ${used_percent}% used, ${free_percent}% free - SAFE" >> "$REPORT"
+                          else
+                            echo "- WARNING: DB ${DATABASE_NAME}: ${max_size_gb} GB max, ${used_percent}% used, ${free_percent}% free - ALERT (>= ${SQL_STORAGE_WARN_PERCENT}%)" >> "$REPORT"
+                          fi
                         else
-                          echo "- WARNING: DB ${DATABASE_NAME}: ${max_size_gb} GB max, ${used_percent}% used, ${free_percent}% free - ALERT (>= ${SQL_STORAGE_WARN_PERCENT}%)" >> "$REPORT"
+                          echo "- DB ${DATABASE_NAME}: usage unavailable" >> "$REPORT"
                         fi
-                      else
-                        echo "- DB ${DATABASE_NAME}: usage unavailable" >> "$REPORT"
-                      fi
-                    done
+                      done
+                    fi
                   fi
 
+                  # UsedCapacity is a daily metric (emitted ~once/day with lag), so query a
+                  # multi-day window and take the most recent NON-null sample. A 1-hour default
+                  # window almost always misses the daily data point and reports 0.00.
+                  STORAGE_METRIC_START=$(date -u -d "2 days ago" +%Y-%m-%dT%H:%MZ 2>/dev/null || date -u -v-2d +%Y-%m-%dT%H:%MZ)
                   for STORAGE_ACCOUNT_ID in $(az storage account list -g "$RESOURCE_GROUP" --query "[].id" -o tsv 2>/dev/null || true); do
-                    STORAGE_USED_BYTES=$(az monitor metrics list --resource "$STORAGE_ACCOUNT_ID" --metric UsedCapacity --interval PT1H --query "value[0].timeseries[0].data[-1].average" -o tsv 2>/dev/null || echo "")
+                    STORAGE_USED_BYTES=$(az monitor metrics list --resource "$STORAGE_ACCOUNT_ID" --metric UsedCapacity --aggregation Average --start-time "$STORAGE_METRIC_START" --interval PT1H --query "value[0].timeseries[0].data[?average!=null].average | [-1]" -o tsv 2>/dev/null || echo "")
                     if [ -n "${STORAGE_USED_BYTES:-}" ] && [ "$STORAGE_USED_BYTES" != "None" ]; then
                       echo "- Archival ${STORAGE_ACCOUNT_ID##*/}: $(awk -v bytes="$STORAGE_USED_BYTES" 'BEGIN{printf "%.2f",bytes/1073741824}') GiB used" >> "$REPORT"
                     fi
@@ -290,12 +298,12 @@ stages:
                 if date -u -d "yesterday" +%F >/dev/null 2>&1; then
                   CURRENT_WEEK_END=$(date -u -d "yesterday" +%F)
                   CURRENT_WEEK_START=$(date -u -d "8 days ago" +%F)
-                  PRIOR_WEEK_END=$(date -u -d "8 days ago" +%F)
+                  PRIOR_WEEK_END=$(date -u -d "9 days ago" +%F)
                   PRIOR_WEEK_START=$(date -u -d "15 days ago" +%F)
                 else
                   CURRENT_WEEK_END=$(date -u -v-1d +%F)
                   CURRENT_WEEK_START=$(date -u -v-8d +%F)
-                  PRIOR_WEEK_END=$(date -u -v-8d +%F)
+                  PRIOR_WEEK_END=$(date -u -v-9d +%F)
                   PRIOR_WEEK_START=$(date -u -v-15d +%F)
                 fi
 
@@ -312,7 +320,8 @@ stages:
                       CERT_NAME=$(echo "$cert_json" | jq -r '.name')
                       CERT_EXPIRY=$(echo "$cert_json" | jq -r '.exp')
                       [ "$CERT_EXPIRY" = "null" ] && continue
-                      CERT_EXPIRY_EPOCH=$(date -u -d "$CERT_EXPIRY" +%s 2>/dev/null || date -u -j -f "%Y-%m-%dT%H:%M:%S+00:00" "${CERT_EXPIRY%%.*}+00:00" +%s 2>/dev/null || echo 0)
+                      CERT_EXPIRY_CLEAN="${CERT_EXPIRY%%+*}"; CERT_EXPIRY_CLEAN="${CERT_EXPIRY_CLEAN%Z}"
+                      CERT_EXPIRY_EPOCH=$(date -u -d "$CERT_EXPIRY" +%s 2>/dev/null || date -u -j -f "%Y-%m-%dT%H:%M:%S" "$CERT_EXPIRY_CLEAN" +%s 2>/dev/null || echo 0)
                       [ "$CERT_EXPIRY_EPOCH" = "0" ] && continue
                       CERT_DAYS_REMAINING=$(( (CERT_EXPIRY_EPOCH - CURRENT_EPOCH) / 86400 ))
                       if [ "$CERT_DAYS_REMAINING" -lt 0 ]; then
