@@ -30,7 +30,21 @@ EOF
 )"
 fi
 
+# Sample "normal" lines (the healthy/informational results the pipeline collects).
+NORMAL="$(cat <<'EOF'
+Log ingestion: peak 41.2 GB/day, avg 28.7 GB/day
+Frontdoor traffic: peak 1240500 requests/day
+Error count: peak 312 errors/day
+DB sqldb-asgardeo-is-identity-prod: 250.00 GB max, 41.0% used, 59.0% free - SAFE
+Archival stasgardeoarchiveprod: 18.43 GiB used
+Cost: this week $1204.55 | prior $1188.10
+Secure score: 78%
+All pods Running/Completed.
+EOF
+)"
+
 COUNT=$(printf '%s\n' "$ANOMALIES" | grep -c . || true)
+NORMAL_COUNT=$(printf '%s\n' "$NORMAL" | grep -c . || true)
 
 if [ "$COUNT" -eq 0 ]; then
   SECTION=$(jq -n '{header:"Status",widgets:[{decoratedText:{startIcon:{materialIcon:{name:"check_circle"}},text:"<b>No anomalies detected this week.</b>"}}]}')
@@ -43,14 +57,27 @@ else
   SUB="$COUNT anomaly(ies) detected"
 fi
 
+# Collapsible "Normal" section: hidden until expanded.
+if [ "$NORMAL_COUNT" -gt 0 ]; then
+  NORMAL_SECTION=$(printf '%s' "$NORMAL" | jq -R -s --arg c "$NORMAL_COUNT" '
+    {header:("Normal ("+$c+")"),
+     collapsible:true,
+     uncollapsibleWidgetsCount:0,
+     widgets:(split("\n")|map(select(length>0))[:50]
+              |map({decoratedText:{startIcon:{materialIcon:{name:"check_circle"}},text:.}}))}')
+else
+  NORMAL_SECTION=null
+fi
+
 CARD=$(jq -n --arg sub "$SUB" --arg ts "$(date -u '+%Y-%m-%d %H:%M UTC')" \
-  --arg url "${BUILD_URL:-https://dev.azure.com}" --argjson section "$SECTION" '
+  --arg url "${BUILD_URL:-https://dev.azure.com}" --argjson section "$SECTION" \
+  --argjson normal "$NORMAL_SECTION" '
   {cardsV2:[{cardId:"asgardeo-preflight",card:{
     header:{title:"Asgardeo Preflight",subtitle:($ts+"  |  "+$sub),
             imageType:"CIRCLE",imageUrl:"https://wso2.cachefly.net/wso2/sites/all/image_resources/asgardeo-logo-deverloper-page.webp"},
-    sections:[ $section,
+    sections:([ $section, $normal,
       {widgets:[{buttonList:{buttons:[{text:"Open pipeline run",
-         onClick:{openLink:{url:$url}}}]}}]} ]}}]}')
+         onClick:{openLink:{url:$url}}}]}}]} ] | map(select(. != null)))}}]}')
 
 if [ "$MODE" = "print" ] || [ -z "$WEBHOOK" ]; then
   echo "$CARD" | jq .

@@ -373,6 +373,10 @@ stages:
               WARNING_LINES=$(grep "WARNING:" "$(reportFile)" | sed -E 's/^[[:space:]]*-?[[:space:]]*WARNING:[[:space:]]*//' || true)
               WARNING_COUNT=$(printf '%s\n' "$WARNING_LINES" | grep -c . || true)
 
+              # Normal / informational status lines: top-level bullets that are not warnings.
+              NORMAL_LINES=$(grep -E '^- ' "$(reportFile)" | grep -v "WARNING:" | sed -E 's/^- //' || true)
+              NORMAL_COUNT=$(printf '%s\n' "$NORMAL_LINES" | grep -c . || true)
+
               if [ "$WARNING_COUNT" -eq 0 ]; then
                 CHAT_CARD_SECTION=$(jq -n '{header:"Status",widgets:[{decoratedText:{startIcon:{materialIcon:{name:"check_circle"}},text:"<b>No anomalies detected this week.</b>"}}]}')
                 CHAT_CARD_SUBTITLE="No anomalies"
@@ -384,17 +388,31 @@ stages:
                 CHAT_CARD_SUBTITLE="$WARNING_COUNT anomaly(ies) detected"
               fi
 
+              # Collapsible "Normal" section: hidden until expanded, so healthy results
+              # are available for context without crowding out the anomalies.
+              if [ "$NORMAL_COUNT" -gt 0 ]; then
+                CHAT_CARD_NORMAL_SECTION=$(printf '%s' "$NORMAL_LINES" | jq -R -s --arg count "$NORMAL_COUNT" '
+                  {header:("Normal ("+$count+")"),
+                  collapsible:true,
+                  uncollapsibleWidgetsCount:0,
+                  widgets:(split("\n")|map(select(length>0))[:50]
+                            |map({decoratedText:{startIcon:{materialIcon:{name:"check_circle"}},text:.}}))}')
+              else
+                CHAT_CARD_NORMAL_SECTION=null
+              fi
+
               CHAT_CARD_PAYLOAD=$(jq -n \
                 --arg subtitle "$CHAT_CARD_SUBTITLE" \
                 --arg timestamp "$(date -u '+%Y-%m-%d %H:%M UTC')" \
                 --arg pipeline_url "${BUILD_URL:-}" \
-                --argjson section "$CHAT_CARD_SECTION" '
+                --argjson section "$CHAT_CARD_SECTION" \
+                --argjson normal "$CHAT_CARD_NORMAL_SECTION" '
                 {cardsV2:[{cardId:"asgardeo-preflight",card:{
                   header:{title:"Asgardeo Preflight Check",subtitle:($timestamp+"  |  "+$subtitle),
                           imageType:"CIRCLE",imageUrl:"https://wso2.cachefly.net/wso2/sites/all/image_resources/asgardeo-logo-deverloper-page.webp"},
-                  sections:[ $section,
+                  sections:([ $section, $normal,
                     {widgets:[{buttonList:{buttons:[{text:"Open pipeline run",
-                      onClick:{openLink:{url:$pipeline_url}}}]}}]} ]}}]}')
+                      onClick:{openLink:{url:$pipeline_url}}}]}}]} ] | map(select(. != null)))}}]}')
 
               curl -sS -H "Content-Type: application/json" -d "$CHAT_CARD_PAYLOAD" "$GCHAT_WEBHOOK_URL" >/dev/null \
                 && echo "Posted card to Google Chat ($WARNING_COUNT anomalies)."
