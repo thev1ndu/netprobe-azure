@@ -31,8 +31,9 @@ EOF
 fi
 
 # Sample "normal" lines (the healthy/informational results the pipeline collects).
+# Node Utilisation lines use <br>• to embed sub-nodes within a single widget.
 NORMAL="$(cat <<'EOF'
-Log ingestion: peak 41.2 GB/day, avg 28.7 GB/day
+Log ingestion: peak 41.20 GB/day, avg 28.73 GB/day
 Frontdoor traffic: peak 1240500 requests/day
 Error count: peak 312 errors/day
 DB sqldb-asgardeo-is-identity-prod: 250.00 GB max, 41.0% used, 59.0% free - SAFE
@@ -40,6 +41,7 @@ Archival stasgardeoarchiveprod: 18.43 GiB used
 Cost: this week $1204.55 | prior $1188.10
 Secure score: 78%
 All pods Running/Completed.
+Node Utilisation :: aks-wso2is<br>• aks-nodepool1-20336172-vmss000002 CPU:4% mem:22%<br>• aks-nodepool1-20336172-vmss000003 CPU:4% mem:28%
 EOF
 )"
 

@@ -120,8 +120,8 @@ stages:
                       | summarize TotalVolumeGB = sum(Quantity_d / 1000.) by bin(TimeGenerated, 1d)
                       | project Day = TimeGenerated, TotalVolumeGB
                       | order by Day asc')
-                    log_ingestion_peak_gb=$(echo "$log_ingestion_by_day" | jq -r '[.[].TotalVolumeGB|tonumber]|max // 0')
-                    log_ingestion_avg_gb=$(echo "$log_ingestion_by_day" | jq -r 'if length == 0 then 0 else ([.[].TotalVolumeGB|tonumber]|add) / length end')
+                    log_ingestion_peak_gb=$(printf '%.2f' "$(echo "$log_ingestion_by_day" | jq -r '[.[].TotalVolumeGB|tonumber]|max // 0')")
+                    log_ingestion_avg_gb=$(printf '%.2f' "$(echo "$log_ingestion_by_day" | jq -r 'if length == 0 then 0 else ([.[].TotalVolumeGB|tonumber]|add) / length end')")
                     echo "- Log ingestion: peak ${log_ingestion_peak_gb} GB/day, avg ${log_ingestion_avg_gb} GB/day" >> "$REPORT"
                     awk -v peak="$log_ingestion_peak_gb" -v avg="$log_ingestion_avg_gb" \
                       'BEGIN{exit (avg>0 && peak>2*avg)?0:1}' \
@@ -130,9 +130,11 @@ stages:
                     {
                       echo ""
                       echo "#### Log Ingestion by Day"
-                      echo "| Day | TotalVolumeGB |"
-                      echo "|-----|---------------|"
-                      echo "$log_ingestion_by_day" | jq -r '.[] | "| \(.Day // .TimeGenerated) | \(.TotalVolumeGB) |"'
+                      echo ""
+                      echo "| Date | Volume (GB) |"
+                      echo "|------|-------------|"
+                      echo "$log_ingestion_by_day" | jq -r '.[] | "\((.Day // .TimeGenerated)[:10])\t\(.TotalVolumeGB | tonumber)"' \
+                        | awk '{printf "| %s | %.2f |\n", $1, $2}'
                     } >> "$DETAIL_FILE"
 
                     # ── Frontdoor Traffic ─────────────────────────────────────────────────
@@ -146,9 +148,10 @@ stages:
                     {
                       echo ""
                       echo "#### Frontdoor Requests by Day"
-                      echo "| Day | Requests |"
-                      echo "|-----|----------|"
-                      echo "$frontdoor_requests_by_day" | jq -r '.[] | "| \(.Day // .TimeGenerated) | \(.Requests) |"'
+                      echo ""
+                      echo "| Date | Requests |"
+                      echo "|------|----------|"
+                      echo "$frontdoor_requests_by_day" | jq -r '.[] | "| \((.Day // .TimeGenerated)[:10]) | \(.Requests) |"'
                     } >> "$DETAIL_FILE"
 
                     # ── IS Error Count ────────────────────────────────────────────────────
@@ -172,9 +175,10 @@ stages:
                     {
                       echo ""
                       echo "#### IS Errors by Day"
-                      echo "| Day | Count |"
-                      echo "|-----|-------|"
-                      echo "$is_errors_by_day" | jq -r '.[] | "| \(.Day // .TimeGenerated) | \(.Count) |"'
+                      echo ""
+                      echo "| Date | Error Count |"
+                      echo "|------|-------------|"
+                      echo "$is_errors_by_day" | jq -r '.[] | "| \((.Day // .TimeGenerated)[:10]) | \(.Count) |"'
                     } >> "$DETAIL_FILE"
 
                     # ── Top Error Tenants ─────────────────────────────────────────────────
@@ -387,11 +391,17 @@ stages:
                   fi
                   node_utilisation=$(kubectl top nodes --no-headers 2>/dev/null || true)
                   if [ -n "$node_utilisation" ]; then
-                    # kubectl top nodes columns: NAME CPU(cores) CPU% MEMORY(bytes) MEMORY%.
-                    # One bullet per node so each gets its own Chat card widget (avoids
-                    # truncation when node names are long and multiple nodes are present).
-                    echo "$node_utilisation" | awk 'NF{print "- Node utilisation: " $1 " CPU:" $3 " mem:" $5}' >> "$REPORT"
-                    printf '```\n%s\n```\n' "$node_utilisation" >> "$REPORT"
+                    # kubectl top nodes columns: NAME CPU(cores) CPU% MEMORY(bytes) MEMORY%
+                    echo "- Node Utilisation :: ${{ env.name }}" >> "$REPORT"
+                    echo "$node_utilisation" | awk 'NF{printf "  - %s CPU:%s mem:%s\n", $1, $3, $5}' >> "$REPORT"
+                    {
+                      echo ""
+                      echo "#### Node Utilisation — ${{ env.name }}"
+                      echo ""
+                      echo "| Node | CPU (cores) | CPU% | Memory | Memory% |"
+                      echo "|------|-------------|------|--------|---------|"
+                      echo "$node_utilisation" | awk 'NF{printf "| %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5}'
+                    } >> "$REPORT"
                   else
                     echo "- WARNING: kubectl top nodes returned no data (metrics-server unavailable?)." >> "$REPORT"
                   fi
@@ -452,7 +462,21 @@ stages:
               WARNING_COUNT=$(printf '%s\n' "$WARNING_LINES" | grep -c . || true)
 
               # Normal / informational status lines: top-level bullets that are not warnings.
-              NORMAL_LINES=$(grep -E '^- ' "$(reportFile)" | grep -v "WARNING:" | sed -E 's/^- //' || true)
+              # Sub-bullets (  - ) are collapsed into their parent line using <br>• so that
+              # Google Chat renders nodes as indented sub-items within one card widget.
+              NORMAL_LINES=$(awk '
+                /^- / && !/WARNING:/ {
+                  if (buf != "") print buf
+                  buf = substr($0, 3)
+                  next
+                }
+                /^  - / {
+                  buf = buf "<br>• " substr($0, 5)
+                  next
+                }
+                { if (buf != "") { print buf; buf = "" } }
+                END { if (buf != "") print buf }
+              ' "$(reportFile)" || true)
               NORMAL_COUNT=$(printf '%s\n' "$NORMAL_LINES" | grep -c . || true)
 
               if [ "$WARNING_COUNT" -eq 0 ]; then
