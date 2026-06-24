@@ -106,6 +106,10 @@ stages:
                     continue
                   fi
                   echo -e "\n## [$ENV_NAME] $RESOURCE_GROUP" >> "$REPORT"
+                  # Collect result tables here and flush them under a single
+                  # "Details" heading after the summary bullets, so each env
+                  # section reads as summary-first, raw-data-second.
+                  DETAIL_FILE=$(mktemp)
 
                   if [ -z "$LOG_ANALYTICS_WORKSPACE_ID" ] || [ "$LOG_ANALYTICS_WORKSPACE_ID" = "null" ]; then
                     LOG_ANALYTICS_WORKSPACE_ID=$(az monitor log-analytics workspace list -g "$RESOURCE_GROUP" --query "[0].customerId" -o tsv 2>/dev/null || true)
@@ -128,13 +132,11 @@ stages:
 
                     {
                       echo ""
-                      echo "### KQL: Log Ingestion by Day"
-                      echo '```'
+                      echo "#### Log Ingestion by Day"
                       echo "| Day | TotalVolumeGB |"
                       echo "|-----|---------------|"
                       echo "$log_ingestion_by_day" | jq -r '.[] | "| \(.Day // .TimeGenerated) | \(.TotalVolumeGB) |"'
-                      echo '```'
-                    } >> "$REPORT"
+                    } >> "$DETAIL_FILE"
 
                     # ── Frontdoor Traffic ─────────────────────────────────────────────────
                     frontdoor_requests_by_day=$(run_kql_query 'FrontdoorAccessLog_CL
@@ -146,13 +148,11 @@ stages:
 
                     {
                       echo ""
-                      echo "### KQL: Frontdoor Requests by Day"
-                      echo '```'
+                      echo "#### Frontdoor Requests by Day"
                       echo "| Day | Requests |"
                       echo "|-----|----------|"
                       echo "$frontdoor_requests_by_day" | jq -r '.[] | "| \(.Day // .TimeGenerated) | \(.Requests) |"'
-                      echo '```'
-                    } >> "$REPORT"
+                    } >> "$DETAIL_FILE"
 
                     # ── IS Error Count ────────────────────────────────────────────────────
                     is_errors_by_day=$(run_kql_query 'ContainerLog_CL
@@ -174,13 +174,11 @@ stages:
 
                     {
                       echo ""
-                      echo "### KQL: IS Errors by Day"
-                      echo '```'
+                      echo "#### IS Errors by Day"
                       echo "| Day | Count |"
                       echo "|-----|-------|"
                       echo "$is_errors_by_day" | jq -r '.[] | "| \(.Day // .TimeGenerated) | \(.Count) |"'
-                      echo '```'
-                    } >> "$REPORT"
+                    } >> "$DETAIL_FILE"
 
                     # ── Top Error Tenants ─────────────────────────────────────────────────
                     top_error_tenants=$(run_kql_query 'let paramPodNamePrefix = "wso2is-deployment";
@@ -218,13 +216,11 @@ stages:
 
                     {
                       echo ""
-                      echo "### KQL: Top 5 Error Tenants"
-                      echo '```'
+                      echo "#### Top 5 Error Tenants"
                       echo "| TenantName | LogCount |"
                       echo "|------------|----------|"
                       echo "$top_error_tenants" | jq -r '.[] | "| \(.TenantName) | \(.LogCount) |"'
-                      echo '```'
-                    } >> "$REPORT"
+                    } >> "$DETAIL_FILE"
 
                     # ── Top Traffic Tenants ───────────────────────────────────────────────
                     top_traffic_tenants=$(run_kql_query 'FrontdoorAccessLog_CL
@@ -243,13 +239,11 @@ stages:
 
                     {
                       echo ""
-                      echo "### KQL: Top 5 Traffic Tenants"
-                      echo '```'
+                      echo "#### Top 5 Traffic Tenants"
                       echo "| Tenant | RequestCount |"
                       echo "|--------|--------------|"
                       echo "$top_traffic_tenants" | jq -r '.[] | "| \(.tenant) | \(.request_count) |"'
-                      echo '```'
-                    } >> "$REPORT"
+                    } >> "$DETAIL_FILE"
 
                   else
                     echo "- WARNING: No Log Analytics workspace in \`$RESOURCE_GROUP\` - log checks skipped." >> "$REPORT"
@@ -284,6 +278,12 @@ stages:
                       echo "- Archival ${STORAGE_ACCOUNT_ID##*/}: $(awk -v bytes="$STORAGE_USED_BYTES" 'BEGIN{printf "%.2f",bytes/1073741824}') GiB used" >> "$REPORT"
                     fi
                   done
+
+                  # Flush the collected result tables after the summary bullets.
+                  if [ -s "$DETAIL_FILE" ]; then
+                    { echo ""; echo "### Details — [$ENV_NAME]"; cat "$DETAIL_FILE"; } >> "$REPORT"
+                  fi
+                  rm -f "$DETAIL_FILE"
                 done
 
                 CURRENT_EPOCH=$(date -u +%s)
