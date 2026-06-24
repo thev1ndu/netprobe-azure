@@ -63,10 +63,7 @@ stages:
           - bash: |
               set -euo pipefail
               sudo apt-get update -qq && sudo apt-get install -y jq
-              # Cost Management queries need the 'costmanagement' CLI extension,
-              # which is not preinstalled on the agent. Without it az errors out.
-              az extension add --name costmanagement --yes --only-show-errors
-            displayName: Install jq and costmanagement extension
+            displayName: Install jq
 
           - task: AzureCLI@2
             displayName: Run pre-flight checks
@@ -332,18 +329,16 @@ stages:
                     done
                   done
 
-                  # Run the cost query, capturing stderr so a failure (missing
-                  # 'costmanagement' extension, 403, throttling) surfaces as a real
-                  # error instead of being silently reported as $0.00.
+                  # Run the cost query via the REST API directly (az rest) so there
+                  # is no dependency on the 'costmanagement' CLI extension, which is
+                  # deprecated in newer Azure CLI versions and unreliable to install.
                   COST_QUERY_ERROR=""
                   query_subscription_cost() {
-                    az costmanagement query \
-                      --type ActualCost \
-                      --timeframe Custom \
-                      --time-period from="$1" to="$2" \
-                      --dataset-granularity None \
-                      --dataset-aggregation '{"total":{"name":"Cost","function":"Sum"}}' \
-                      --scope "/subscriptions/$SUBSCRIPTION_ID" \
+                    local from_date="$1" to_date="$2"
+                    az rest \
+                      --method POST \
+                      --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/providers/Microsoft.CostManagement/query?api-version=2023-11-01" \
+                      --body "{\"type\":\"ActualCost\",\"timeframe\":\"Custom\",\"timePeriod\":{\"from\":\"${from_date}\",\"to\":\"${to_date}\"},\"dataset\":{\"granularity\":\"None\",\"aggregation\":{\"totalCost\":{\"name\":\"Cost\",\"function\":\"Sum\"}}}}" \
                       --query "properties.rows[0][0]" -o tsv
                   }
                   CURRENT_WEEK_COST=$(query_subscription_cost "$CURRENT_WEEK_START" "$CURRENT_WEEK_END" 2>/tmp/cost_err) \
