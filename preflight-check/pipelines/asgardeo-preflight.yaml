@@ -61,8 +61,12 @@ stages:
           - checkout: none
 
           - bash: |
+              set -euo pipefail
               sudo apt-get update -qq && sudo apt-get install -y jq
-            displayName: Install jq
+              # Cost Management queries need the 'costmanagement' CLI extension,
+              # which is not preinstalled on the agent. Without it az errors out.
+              az extension add --name costmanagement --yes --only-show-errors
+            displayName: Install jq and costmanagement extension
 
           - task: AzureCLI@2
             displayName: Run pre-flight checks
@@ -111,8 +115,8 @@ stages:
                     run_kql_query() { az monitor log-analytics query -w "$LOG_ANALYTICS_WORKSPACE_ID" --analytics-query "$1" --timespan "P${LOOKBACK_DAYS}D" -o json 2>/dev/null || echo '[]'; }
 
                     # ── Log Ingestion ─────────────────────────────────────────────────────
-                    log_ingestion_by_day=$(run_kql_query 'Usage
-                      | summarize TotalVolumeGB = sum(Quantity / 1000.) by bin(TimeGenerated, 1d)
+                    log_ingestion_by_day=$(run_kql_query 'Usage_CL
+                      | summarize TotalVolumeGB = sum(Quantity_d / 1000.) by bin(TimeGenerated, 1d)
                       | project Day = TimeGenerated, TotalVolumeGB
                       | order by Day asc')
                     log_ingestion_peak_gb=$(echo "$log_ingestion_by_day" | jq -r '[.[].TotalVolumeGB|tonumber]|max // 0')
@@ -133,8 +137,7 @@ stages:
                     } >> "$REPORT"
 
                     # ── Frontdoor Traffic ─────────────────────────────────────────────────
-                    frontdoor_requests_by_day=$(run_kql_query 'AzureDiagnostics
-                      | where Category =~ "FrontdoorAccessLog"
+                    frontdoor_requests_by_day=$(run_kql_query 'FrontdoorAccessLog_CL
                       | summarize Requests = count() by bin(TimeGenerated, 1d)
                       | project Day = TimeGenerated, Requests
                       | order by Day asc')
@@ -152,13 +155,14 @@ stages:
                     } >> "$REPORT"
 
                     # ── IS Error Count ────────────────────────────────────────────────────
-                    is_errors_by_day=$(run_kql_query 'ContainerLog
+                    is_errors_by_day=$(run_kql_query 'ContainerLog_CL
                       | join kind=inner (
-                          KubePodInventory
-                          | project ContainerID, PodName=Name, Namespace
+                          KubePodInventory_CL
+                          | project ContainerID_s, PodName = Name_s, ControllerKind_s, ControllerName_s, Namespace_s
                           | distinct *
-                        ) on ContainerID
-                      | where LogEntry has_cs ": ERROR"
+                        ) on ContainerID_s
+                      | project TimeGenerated, Namespace_s, PodName, LogEntry_s, ControllerKind_s, ControllerName_s
+                      | where LogEntry_s has_cs ": ERROR"
                       | summarize Count = count() by bin(TimeGenerated, 1d)
                       | project Day = TimeGenerated, Count
                       | order by Day asc')
@@ -179,15 +183,33 @@ stages:
                     } >> "$REPORT"
 
                     # ── Top Error Tenants ─────────────────────────────────────────────────
-                    top_error_tenants=$(run_kql_query 'ContainerLog
+                    top_error_tenants=$(run_kql_query 'let paramPodNamePrefix = "wso2is-deployment";
+                      let errorTypeT = "ERROR";
+                      let errorRegex = ".*iam-cloud-.* : ERROR {.*} .*";
+                      ContainerLog_CL
                       | join kind=inner (
-                          KubePodInventory
-                          | where Name contains "wso2is-deployment"
-                          | project ContainerID
+                          KubePodInventory_CL
+                          | project ContainerID_s, PodName = Name_s, ControllerKind_s, ControllerName_s, Namespace_s
+                          | where PodName contains paramPodNamePrefix
                           | distinct *
-                        ) on ContainerID
-                      | where LogEntry has_cs "ERROR"
-                      | parse LogEntry with * "Tenant: [" TenantName "]" *
+                        ) on ContainerID_s
+                      | where LogEntry_s has_cs errorTypeT
+                      | where LogEntry_s matches regex errorRegex
+                      | where LogEntry_s !contains "Error when setting claim"
+                      | where LogEntry_s !contains "No message body reader has been found for class java.lang.String, ContentType: application/octet-stream"
+                      | where LogEntry_s !contains "Error occurred while getting database type from DB connection org.wso2.carbon.user.core.UserStoreException: Error occurred while getting database type from DB connection"
+                      | where LogEntry_s !contains "Error occurred while getting database type from DB connection org.wso2.charon3.core.exceptions.CharonException: Error occurred while getting database type from DB connection"
+                      | where LogEntry_s !contains "This password has been used in recent history. Please choose a different password"
+                      | where LogEntry_s !contains "Error occurred while getting the OAuth App tenantDomain by Consumer key: CHOREO_SYSTEM_APP_MANAGER"
+                      | where LogEntry_s !contains "ERROR {org.wso2.carbon.identity.oauth2.grant.jwt.JWTBearerGrantHandler} - JSON Web Token is issued before the allowed time."
+                      | where LogEntry_s !contains "ERROR {org.wso2.carbon.identity.input.validation.mgt.listener.InputValidationListener} - Failed to validate username for user."
+                      | where LogEntry_s !contains "Caused by: java.sql.BatchUpdateException: Violation of UNIQUE KEY constraint '\''UQ__UM_USER___BBB8EC7E9AE1457C'\''. Cannot insert duplicate key in object '\''dbo.UM_USER_ROLE'\''."
+                      | where LogEntry_s !contains "{org.wso2.carbon.identity.application.authentication.framework.config.model.graph.openjdk.nashorn.JsOpenJdkNashornGraphBuilder} - Event handler : authenticationOptions is not a function"
+                      | where LogEntry_s !contains "{org.wso2.carbon.identity.application.authentication.framework.config.model.graph.js.JsClaims} - Error when getting claim : http://wso2.org/claims/identity/country of user"
+                      | where not (LogEntry_s matches regex @"Tenant:\s*\[lilt\].*?iam-cloud-carbon\s*:\s*ERROR\s*\{org.wso2.carbon.identity.application.authentication.framework.config.model.graph.js.JsLogger\}")
+                      | sort by TimeGenerated asc
+                      | project TimeGenerated, LogEntry_s
+                      | parse LogEntry_s with * "Tenant: [" TenantName "]" *
                       | where isnotempty(TenantName)
                       | summarize LogCount = count() by TenantName
                       | top 5 by LogCount desc')
@@ -205,8 +227,7 @@ stages:
                     } >> "$REPORT"
 
                     # ── Top Traffic Tenants ───────────────────────────────────────────────
-                    top_traffic_tenants=$(run_kql_query 'AzureDiagnostics
-                      | where Category =~ "FrontdoorAccessLog"
+                    top_traffic_tenants=$(run_kql_query 'FrontdoorAccessLog_CL
                       | extend reqUri = tostring(requestUri_s)
                       | extend tenant_from_path = extract(@"/t/([^/]+)", 1, reqUri)
                       | extend custom_domain = extract(@"https?://([^/:]+)", 1, reqUri)
@@ -302,6 +323,10 @@ stages:
                     done
                   done
 
+                  # Run the cost query, capturing stderr so a failure (missing
+                  # 'costmanagement' extension, 403, throttling) surfaces as a real
+                  # error instead of being silently reported as $0.00.
+                  COST_QUERY_ERROR=""
                   query_subscription_cost() {
                     az costmanagement query \
                       --type ActualCost \
@@ -310,17 +335,22 @@ stages:
                       --dataset-granularity None \
                       --dataset-aggregation '{"total":{"name":"Cost","function":"Sum"}}' \
                       --scope "/subscriptions/$SUBSCRIPTION_ID" \
-                      --query "properties.rows[0][0]" -o tsv 2>/dev/null || echo 0
+                      --query "properties.rows[0][0]" -o tsv
                   }
-                  CURRENT_WEEK_COST=$(query_subscription_cost "$CURRENT_WEEK_START" "$CURRENT_WEEK_END")
-                  PRIOR_WEEK_COST=$(query_subscription_cost "$PRIOR_WEEK_START" "$PRIOR_WEEK_END")
-                  CURRENT_WEEK_COST=${CURRENT_WEEK_COST:-0}
-                  PRIOR_WEEK_COST=${PRIOR_WEEK_COST:-0}
+                  CURRENT_WEEK_COST=$(query_subscription_cost "$CURRENT_WEEK_START" "$CURRENT_WEEK_END" 2>/tmp/cost_err) \
+                    || COST_QUERY_ERROR=$(tr '\n' ' ' </tmp/cost_err | head -c 300)
+                  PRIOR_WEEK_COST=$(query_subscription_cost "$PRIOR_WEEK_START" "$PRIOR_WEEK_END" 2>/dev/null || true)
 
-                  echo "- Cost: this week (${CURRENT_WEEK_START}..${CURRENT_WEEK_END}) \$$(printf '%.2f' "$CURRENT_WEEK_COST") | prior \$$(printf '%.2f' "$PRIOR_WEEK_COST")" >> "$REPORT"
-                  awk -v current="$CURRENT_WEEK_COST" -v prior="$PRIOR_WEEK_COST" -v threshold="$COST_INCREASE_WARN_PERCENT" \
-                    'BEGIN{exit (prior>0 && ((current-prior)/prior*100)>threshold)?0:1}' \
-                    && echo "  - WARNING: Cost up $(awk -v c="$CURRENT_WEEK_COST" -v p="$PRIOR_WEEK_COST" 'BEGIN{printf "%.1f",(c-p)/p*100}')% week-over-week." >> "$REPORT" || true
+                  if [ -n "$COST_QUERY_ERROR" ]; then
+                    echo "- WARNING: Cost query failed - ${COST_QUERY_ERROR}" >> "$REPORT"
+                  elif [ -z "${CURRENT_WEEK_COST:-}" ] || [ -z "${PRIOR_WEEK_COST:-}" ]; then
+                    echo "- WARNING: Cost query returned no data for ${CURRENT_WEEK_START}..${CURRENT_WEEK_END}." >> "$REPORT"
+                  else
+                    echo "- Cost: this week (${CURRENT_WEEK_START}..${CURRENT_WEEK_END}) \$$(printf '%.2f' "$CURRENT_WEEK_COST") | prior \$$(printf '%.2f' "$PRIOR_WEEK_COST")" >> "$REPORT"
+                    awk -v current="$CURRENT_WEEK_COST" -v prior="$PRIOR_WEEK_COST" -v threshold="$COST_INCREASE_WARN_PERCENT" \
+                      'BEGIN{exit (prior>0 && ((current-prior)/prior*100)>threshold)?0:1}' \
+                      && echo "  - WARNING: Cost up $(awk -v c="$CURRENT_WEEK_COST" -v p="$PRIOR_WEEK_COST" 'BEGIN{printf "%.1f",(c-p)/p*100}')% week-over-week." >> "$REPORT" || true
+                  fi
 
                   SECURE_SCORE_JSON=$(az security secure-scores show --name ascScore -o json 2>/dev/null \
                     || az security secure-scores list -o json 2>/dev/null | jq '.[0]' || echo '{}')
@@ -352,7 +382,16 @@ stages:
                     echo "- All pods Running/Completed." >> "$REPORT"
                   fi
                   node_utilisation=$(kubectl top nodes --no-headers 2>/dev/null || true)
-                  [ -n "$node_utilisation" ] && printf -- '- Node utilisation (name / CPU%% / mem%%):\n```\n%s\n```\n' "$node_utilisation" >> "$REPORT" || true
+                  if [ -n "$node_utilisation" ]; then
+                    # kubectl top nodes columns: NAME CPU(cores) CPU% MEMORY(bytes) MEMORY%.
+                    # Put a compact per-node summary on the bullet so the Chat card (which
+                    # only reads top-level "- " lines) shows the values, not just a label.
+                    node_summary=$(echo "$node_utilisation" | awk 'NF{printf "%s%s %s/%s", sep, $1, $3, $5; sep=", "}')
+                    echo "- Node utilisation (name CPU%/mem%): ${node_summary}" >> "$REPORT"
+                    printf '```\n%s\n```\n' "$node_utilisation" >> "$REPORT"
+                  else
+                    echo "- WARNING: kubectl top nodes returned no data (metrics-server unavailable?)." >> "$REPORT"
+                  fi
                 displayName: AKS pod/node check [${{ env.name }}]
 
           - bash: cat "$(reportFile)"
