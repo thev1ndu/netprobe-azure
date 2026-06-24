@@ -393,10 +393,9 @@ stages:
                   node_utilisation=$(kubectl top nodes --no-headers 2>/dev/null || true)
                   if [ -n "$node_utilisation" ]; then
                     # kubectl top nodes columns: NAME CPU(cores) CPU% MEMORY(bytes) MEMORY%.
-                    # Put a compact per-node summary on the bullet so the Chat card (which
-                    # only reads top-level "- " lines) shows the values, not just a label.
-                    node_summary=$(echo "$node_utilisation" | awk 'NF{printf "%s%s %s/%s", sep, $1, $3, $5; sep=", "}')
-                    echo "- Node utilisation (name CPU%/mem%): ${node_summary}" >> "$REPORT"
+                    # One bullet per node so each gets its own Chat card widget (avoids
+                    # truncation when node names are long and multiple nodes are present).
+                    echo "$node_utilisation" | awk 'NF{print "- Node utilisation: " $1 " CPU:" $3 " mem:" $5}' >> "$REPORT"
                     printf '```\n%s\n```\n' "$node_utilisation" >> "$REPORT"
                   else
                     echo "- WARNING: kubectl top nodes returned no data (metrics-server unavailable?)." >> "$REPORT"
