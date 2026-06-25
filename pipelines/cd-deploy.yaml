@@ -57,7 +57,7 @@ stages:
       - job: DeployNetProbe
         displayName: Deploy NetProbe to AKS
         pool:
-          name: rnd-thevindu-vmss
+          name: $(AGENT_POOL)
         steps:
           - checkout: none
 
