@@ -1,3 +1,24 @@
+# ──────────────────────────────────────────────────────────────────────────
+# Asgardeo Weekly Pre-Flight Check
+#
+# WHY IT WAS BROKEN (original error):
+#   AzureCLI@2 does NOT install Azure CLI — it assumes `az` is already on the
+#   agent. The self-hosted VMSS pool (rnd-thevindu-vmss) has none, so every
+#   step died with "Unable to locate executable file: 'az'".
+#   FIX: STEP 0 installs az + jq + openpyxl before any Azure step.
+#
+# OUTPUT:
+#   Each check writes its rows to one CSV in $(workDir). A final step combines
+#   every CSV into a single multi-tab Excel workbook (one tab per check) and
+#   uploads it to blob:  sa18436 / preflight (container).
+#
+# PATTERN (every check, ~8 lines):
+#   1. run the query           -> JSON
+#   2. JSON -> CSV             -> $(workDir)/NN_Tab_Name.csv   (becomes a tab)
+#   3. append one summary row  -> 00_Summary.csv               (the Summary tab)
+#   4. on anomaly: echo a line -> warnings.txt   (used by the Google Chat card)
+# ──────────────────────────────────────────────────────────────────────────
+
 trigger: none
 
 schedules:
@@ -7,34 +28,36 @@ schedules:
     always: true
 
 parameters:
-  - name: lookbackDays              # log/metric query window
+  - name: lookbackDays
     type: number
     default: 7
-  - name: certExpiryWarningDays     # flag certs expiring within N days
+  - name: certExpiryWarningDays
     type: number
     default: 30
-  - name: sqlStorageWarnPercent     # flag SQL DBs over N% full
+  - name: sqlStorageWarnPercent
     type: number
     default: 75
-  - name: errorCountDailyThreshold  # flag if any day's IS errors exceed N
+  - name: errorCountDailyThreshold
     type: number
     default: 5000
-  - name: apiLatencyThresholdSeconds # flag endpoints slower than N seconds
+  - name: apiLatencyThresholdSeconds
     type: number
     default: 1.0
-  - name: costIncreasePercentThreshold # flag WoW cost increase over N%
+  - name: costIncreasePercentThreshold
     type: number
     default: 20
 
-# ── Target environment (single env = clear & flat). To add more, copy this
-#    block into a matrix or loop later; the per-step logic stays the same. ──
 variables:
-  reportFile:           $(Build.ArtifactStagingDirectory)/preflight-report.md
+  workDir:              $(Build.ArtifactStagingDirectory)/checks     # one CSV per check
+  workbook:             $(Build.ArtifactStagingDirectory)/preflight-report.xlsx
+  warnings:             $(Build.ArtifactStagingDirectory)/warnings.txt
   subscriptionId:       '38785beb-5019-4896-8679-3d41ddacc4b1'
   resourceGroup:        'rg-thevindu'
   workspaceId:          'e5d406b5-f761-48a7-9466-9d0d4a768f01'
   sqlServer:            ''                      # empty = skip SQL check
   aksServiceConnection: 'rnd-aks-thevindu'
+  storageAccount:       'sa18436'
+  blobContainer:        'preflight'
 
 stages:
   - stage: PreFlight
@@ -46,25 +69,24 @@ stages:
         steps:
           - checkout: none
 
-          # ── STEP 0 — THE FIX: make sure az + jq exist on the agent ────────
+          # ── STEP 0 — THE FIX: tools on the agent ──────────────────────────
           - bash: |
               set -euo pipefail
-              command -v az >/dev/null 2>&1 || curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
-              command -v jq >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y jq; }
-              az version
-            displayName: 0. Install Azure CLI + jq
+              command -v az   >/dev/null 2>&1 || curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+              command -v jq   >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y jq; }
+              command -v pip3 >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y python3-pip; }
+              python3 -m pip install --quiet --user openpyxl --break-system-packages 2>/dev/null \
+                || python3 -m pip install --quiet --user openpyxl
+            displayName: 0. Install az + jq + openpyxl
 
-          # ── STEP 1 — start the report file ────────────────────────────────
+          # ── STEP 1 — prepare output dir + Summary tab header ──────────────
           - bash: |
               set -euo pipefail
-              {
-                echo "# Asgardeo Pre-Flight Check — $(date -u '+%Y-%m-%d %H:%M UTC')"
-                echo
-                echo "_Look-back ${{ parameters.lookbackDays }}d. Anomalies = WARNING, rest informational._"
-              } > "$(reportFile)"
-            displayName: 1. Init report
+              mkdir -p "$(workDir)"; : > "$(warnings)"
+              jq -rn '["Check","Result","Status"]|@csv' > "$(workDir)/00_Summary.csv"
+            displayName: 1. Init outputs
 
-          # ── STEP 2 — Log ingestion volume (KQL: Usage_CL) ─────────────────
+          # ── STEP 2 — Log ingestion volume ─────────────────────────────────
           - task: AzureCLI@2
             displayName: 2. Log ingestion volume
             continueOnError: true
@@ -76,14 +98,15 @@ stages:
                 set -uo pipefail
                 az account set -s $(subscriptionId)
                 DATA=$(az monitor log-analytics query -w $(workspaceId) --timespan P${{ parameters.lookbackDays }}D -o json \
-                  --analytics-query 'Usage_CL | summarize GB=sum(Quantity_d/1000.) by bin(TimeGenerated,1d)' || echo '[]')
+                  --analytics-query 'Usage_CL | summarize GB=sum(Quantity_d/1000.) by bin(TimeGenerated,1d) | sort by TimeGenerated asc' || echo '[]')
+                echo "$DATA" | jq -r '["Day","VolumeGB"],(.[]|[(.TimeGenerated[:10]),(.GB|tonumber)])|@csv' > "$(workDir)/01_Log_Ingestion.csv"
                 PEAK=$(echo "$DATA" | jq -r '[.[].GB|tonumber]|max // 0')
                 AVG=$(echo "$DATA"  | jq -r 'if length==0 then 0 else ([.[].GB|tonumber]|add)/length end')
-                printf -- "- Log ingestion: peak %.2f GB/day, avg %.2f GB/day\n" "$PEAK" "$AVG" >> "$(reportFile)"
-                awk -v p="$PEAK" -v a="$AVG" 'BEGIN{exit (a>0 && p>2*a)?0:1}' \
-                  && echo "  - WARNING: peak day >2x the average — investigate." >> "$(reportFile)" || true
+                STATUS=OK; awk -v p="$PEAK" -v a="$AVG" 'BEGIN{exit (a>0 && p>2*a)?0:1}' \
+                  && { STATUS=WARNING; echo "Log ingestion: peak day >2x average" >> "$(warnings)"; }
+                jq -rn --arg r "$(printf 'peak %.2f / avg %.2f GB per day' "$PEAK" "$AVG")" --arg s "$STATUS" '["Log Ingestion",$r,$s]|@csv' >> "$(workDir)/00_Summary.csv"
 
-          # ── STEP 3 — Frontdoor traffic by day ─────────────────────────────
+          # ── STEP 3 — Frontdoor traffic ────────────────────────────────────
           - task: AzureCLI@2
             displayName: 3. Frontdoor traffic
             continueOnError: true
@@ -95,11 +118,12 @@ stages:
                 set -uo pipefail
                 az account set -s $(subscriptionId)
                 DATA=$(az monitor log-analytics query -w $(workspaceId) --timespan P${{ parameters.lookbackDays }}D -o json \
-                  --analytics-query 'FrontdoorAccessLog_CL | summarize Requests=count() by bin(TimeGenerated,1d)' || echo '[]')
+                  --analytics-query 'FrontdoorAccessLog_CL | summarize Requests=count() by bin(TimeGenerated,1d) | sort by TimeGenerated asc' || echo '[]')
+                echo "$DATA" | jq -r '["Day","Requests"],(.[]|[(.TimeGenerated[:10]),(.Requests)])|@csv' > "$(workDir)/02_Frontdoor_Traffic.csv"
                 PEAK=$(echo "$DATA" | jq -r '[.[].Requests|tonumber]|max // 0')
-                echo "- Frontdoor traffic: peak ${PEAK} requests/day" >> "$(reportFile)"
+                jq -rn --arg r "peak ${PEAK} requests/day" '["Frontdoor Traffic",$r,"OK"]|@csv' >> "$(workDir)/00_Summary.csv"
 
-          # ── STEP 4 — IS error count by day ────────────────────────────────
+          # ── STEP 4 — IS error count ───────────────────────────────────────
           - task: AzureCLI@2
             displayName: 4. IS error count
             continueOnError: true
@@ -114,13 +138,14 @@ stages:
                   --analytics-query 'ContainerLog_CL
                     | join kind=inner (KubePodInventory_CL | project ContainerID_s, PodName=Name_s | distinct *) on ContainerID_s
                     | where LogEntry_s has_cs ": ERROR"
-                    | summarize Count=count() by bin(TimeGenerated,1d)' || echo '[]')
+                    | summarize Count=count() by bin(TimeGenerated,1d) | sort by TimeGenerated asc' || echo '[]')
+                echo "$DATA" | jq -r '["Day","ErrorCount"],(.[]|[(.TimeGenerated[:10]),(.Count)])|@csv' > "$(workDir)/03_IS_Errors.csv"
                 PEAK=$(echo "$DATA" | jq -r '[.[].Count|tonumber]|max // 0')
-                echo "- Error count: peak ${PEAK} errors/day" >> "$(reportFile)"
-                awk -v p="$PEAK" -v t="${{ parameters.errorCountDailyThreshold }}" 'BEGIN{exit (p>t)?0:1}' \
-                  && echo "  - WARNING: daily error count exceeded ${{ parameters.errorCountDailyThreshold }}." >> "$(reportFile)" || true
+                STATUS=OK; awk -v p="$PEAK" -v t="${{ parameters.errorCountDailyThreshold }}" 'BEGIN{exit (p>t)?0:1}' \
+                  && { STATUS=WARNING; echo "IS errors: peak ${PEAK}/day exceeded ${{ parameters.errorCountDailyThreshold }}" >> "$(warnings)"; }
+                jq -rn --arg r "peak ${PEAK} errors/day" --arg s "$STATUS" '["IS Errors",$r,$s]|@csv' >> "$(workDir)/00_Summary.csv"
 
-          # ── STEP 5 — Top error tenants (noisy IAM errors filtered out) ────
+          # ── STEP 5 — Top error tenants ────────────────────────────────────
           - task: AzureCLI@2
             displayName: 5. Top error tenants
             continueOnError: true
@@ -142,14 +167,13 @@ stages:
                     | where LogEntry_s !contains "JSON Web Token is issued before the allowed time"
                     | parse LogEntry_s with * "Tenant: [" TenantName "]" *
                     | where isnotempty(TenantName)
-                    | summarize LogCount=count() by TenantName
-                    | top 5 by LogCount desc' || echo '[]')
-                SUMMARY=$(echo "$DATA" | jq -r '[.[]|"\(.TenantName)=\(.LogCount)"]|join(", ")')
-                [ -n "$SUMMARY" ] && echo "- Top error tenants: ${SUMMARY}" >> "$(reportFile)" || true
+                    | summarize LogCount=count() by TenantName | top 5 by LogCount desc' || echo '[]')
+                echo "$DATA" | jq -r '["TenantName","LogCount"],(.[]|[.TenantName,.LogCount])|@csv' > "$(workDir)/04_Error_Tenants.csv"
+                TOP=$(echo "$DATA" | jq -r '[.[]|"\(.TenantName)=\(.LogCount)"]|join(", ")')
+                jq -rn --arg r "${TOP:-none}" '["Top Error Tenants",$r,"OK"]|@csv' >> "$(workDir)/00_Summary.csv"
 
-          # ── STEP 6 — API latency (avg per endpoint) ───────────────────────
+          # ── STEP 6 — API latency ──────────────────────────────────────────
           #    NOTE: assumes the Front Door latency column is `timeTaken_d`.
-          #    If your log uses a different field, change it on the line below.
           - task: AzureCLI@2
             displayName: 6. API latency
             continueOnError: true
@@ -164,17 +188,13 @@ stages:
                   --analytics-query 'FrontdoorAccessLog_CL
                     | extend Path = extract(@"https?://[^/]+(/[^?]*)", 1, tostring(requestUri_s))
                     | where isnotempty(Path)
-                    | summarize AvgLatency=avg(timeTaken_d) by Path
-                    | top 10 by AvgLatency desc' || echo '[]')
-                SLOW=$(echo "$DATA" | jq -r --argjson t "${{ parameters.apiLatencyThresholdSeconds }}" \
-                  '[.[]|select((.AvgLatency|tonumber) > $t)|"\(.Path)=\(.AvgLatency|tonumber|.*100|round/100)s"]|join(", ")')
-                if [ -n "$SLOW" ]; then
-                  echo "- WARNING: endpoints over ${{ parameters.apiLatencyThresholdSeconds }}s avg latency: ${SLOW}" >> "$(reportFile)"
-                else
-                  echo "- API latency: all endpoints under ${{ parameters.apiLatencyThresholdSeconds }}s avg." >> "$(reportFile)"
-                fi
+                    | summarize AvgLatency=avg(timeTaken_d) by Path | top 10 by AvgLatency desc' || echo '[]')
+                echo "$DATA" | jq -r '["Path","AvgLatencySeconds"],(.[]|[.Path,(.AvgLatency|tonumber)])|@csv' > "$(workDir)/05_API_Latency.csv"
+                SLOW=$(echo "$DATA" | jq -r --argjson t "${{ parameters.apiLatencyThresholdSeconds }}" '[.[]|select((.AvgLatency|tonumber)>$t)|.Path]|length')
+                STATUS=OK; [ "${SLOW:-0}" -gt 0 ] && { STATUS=WARNING; echo "${SLOW} endpoint(s) over ${{ parameters.apiLatencyThresholdSeconds }}s avg latency" >> "$(warnings)"; }
+                jq -rn --arg r "${SLOW:-0} endpoint(s) over ${{ parameters.apiLatencyThresholdSeconds }}s" --arg s "$STATUS" '["API Latency",$r,$s]|@csv' >> "$(workDir)/00_Summary.csv"
 
-          # ── STEP 7 — SQL DB storage growth ────────────────────────────────
+          # ── STEP 7 — SQL DB storage ───────────────────────────────────────
           - task: AzureCLI@2
             displayName: 7. SQL DB storage
             continueOnError: true
@@ -185,23 +205,25 @@ stages:
               inlineScript: |
                 set -uo pipefail
                 az account set -s $(subscriptionId)
+                CSV="$(workDir)/06_SQL_Storage.csv"
+                jq -rn '["Database","MaxGB","UsedPercent","Status"]|@csv' > "$CSV"
                 if [ -z "$(sqlServer)" ]; then
-                  echo "- SQL: not configured — skipped." >> "$(reportFile)"; exit 0
+                  jq -rn '["(not configured)","","","SKIP"]|@csv' >> "$CSV"
+                  jq -rn '["SQL Storage","not configured","SKIP"]|@csv' >> "$(workDir)/00_Summary.csv"; exit 0
                 fi
+                WARN=0; N=0
                 for DB in $(az sql db list -g $(resourceGroup) -s $(sqlServer) --query "[?name!='master'].name" -o tsv); do
-                  USAGE=$(az sql db list-usages -g $(resourceGroup) -s $(sqlServer) -n "$DB" -o json)
-                  USED=$(echo "$USAGE" | jq -r '.[]|select(.name=="database_size")|.currentValue')
-                  MAX=$(echo  "$USAGE" | jq -r '.[]|select(.name=="database_size")|.limit')
-                  [ -z "$MAX" ] || [ "$MAX" = "0" ] && { echo "- DB ${DB}: usage unavailable" >> "$(reportFile)"; continue; }
+                  N=$((N+1)); U=$(az sql db list-usages -g $(resourceGroup) -s $(sqlServer) -n "$DB" -o json)
+                  USED=$(echo "$U" | jq -r '.[]|select(.name=="database_size")|.currentValue')
+                  MAX=$(echo  "$U" | jq -r '.[]|select(.name=="database_size")|.limit')
                   read -r GB PCT <<<"$(awk -v u="$USED" -v m="$MAX" 'BEGIN{printf "%.2f %.1f", m/(1024^3), u/m*100}')"
-                  if awk -v p="$PCT" -v w="${{ parameters.sqlStorageWarnPercent }}" 'BEGIN{exit (p<w)?0:1}'; then
-                    echo "- DB ${DB}: ${GB} GB max, ${PCT}% used — SAFE" >> "$(reportFile)"
-                  else
-                    echo "- WARNING: DB ${DB}: ${GB} GB max, ${PCT}% used (>= ${{ parameters.sqlStorageWarnPercent }}%)" >> "$(reportFile)"
-                  fi
+                  DBSTATUS=OK; awk -v p="$PCT" -v w="${{ parameters.sqlStorageWarnPercent }}" 'BEGIN{exit (p<w)?0:1}' || { DBSTATUS=ALERT; WARN=1; }
+                  jq -rn --arg d "$DB" --arg g "$GB" --arg p "$PCT" --arg s "$DBSTATUS" '[$d,($g|tonumber),($p|tonumber),$s]|@csv' >> "$CSV"
                 done
+                [ "$WARN" = 1 ] && echo "SQL database(s) over ${{ parameters.sqlStorageWarnPercent }}% storage" >> "$(warnings)" || true
+                jq -rn --arg r "${N} db(s) checked" --arg s "$([ "$WARN" = 1 ] && echo WARNING || echo OK)" '["SQL Storage",$r,$s]|@csv' >> "$(workDir)/00_Summary.csv"
 
-          # ── STEP 8 — Archival storage size (daily UsedCapacity metric) ────
+          # ── STEP 8 — Archival storage size ────────────────────────────────
           - task: AzureCLI@2
             displayName: 8. Archival storage size
             continueOnError: true
@@ -212,17 +234,17 @@ stages:
               inlineScript: |
                 set -uo pipefail
                 az account set -s $(subscriptionId)
-                # UsedCapacity emits ~once/day with lag, so query 2 days and take the last non-null sample.
-                START=$(date -u -d "2 days ago" +%Y-%m-%dT%H:%MZ)
+                CSV="$(workDir)/07_Archival_Storage.csv"; jq -rn '["StorageAccount","GiBUsed"]|@csv' > "$CSV"
+                START=$(date -u -d "2 days ago" +%Y-%m-%dT%H:%MZ); N=0
                 for ID in $(az storage account list -g $(resourceGroup) --query "[].id" -o tsv); do
                   BYTES=$(az monitor metrics list --resource "$ID" --metric UsedCapacity --aggregation Average \
-                    --start-time "$START" --interval PT1H \
-                    --query "value[0].timeseries[0].data[?average!=null].average | [-1]" -o tsv 2>/dev/null || echo "")
-                  [ -n "$BYTES" ] && [ "$BYTES" != "None" ] \
-                    && echo "- Archival ${ID##*/}: $(awk -v b="$BYTES" 'BEGIN{printf "%.2f",b/1073741824}') GiB used" >> "$(reportFile)" || true
+                    --start-time "$START" --interval PT1H --query "value[0].timeseries[0].data[?average!=null].average | [-1]" -o tsv 2>/dev/null || echo "")
+                  [ -n "$BYTES" ] && [ "$BYTES" != "None" ] || continue
+                  N=$((N+1)); jq -rn --arg a "${ID##*/}" --arg g "$(awk -v b="$BYTES" 'BEGIN{printf "%.2f",b/1073741824}')" '[$a,($g|tonumber)]|@csv' >> "$CSV"
                 done
+                jq -rn --arg r "${N} account(s)" '["Archival Storage",$r,"OK"]|@csv' >> "$(workDir)/00_Summary.csv"
 
-          # ── STEP 9 — Key Vault certificate expiry ─────────────────────────
+          # ── STEP 9 — Certificate expiry ───────────────────────────────────
           - task: AzureCLI@2
             displayName: 9. Certificate expiry
             continueOnError: true
@@ -233,23 +255,22 @@ stages:
               inlineScript: |
                 set -uo pipefail
                 az account set -s $(subscriptionId)
+                CSV="$(workDir)/08_Certificates.csv"; jq -rn '["Vault","Certificate","DaysRemaining","Status"]|@csv' > "$CSV"
                 NOW=$(date -u +%s)
                 for VAULT in $(az keyvault list --query "[].name" -o tsv); do
-                  az keyvault certificate list --vault-name "$VAULT" \
-                    --query "[].{name:name,exp:attributes.expires}" -o json | jq -c '.[]' | while read -r C; do
-                    NAME=$(echo "$C" | jq -r '.name'); EXP=$(echo "$C" | jq -r '.exp')
-                    [ "$EXP" = "null" ] && continue
+                  az keyvault certificate list --vault-name "$VAULT" --query "[].{name:name,exp:attributes.expires}" -o json | jq -c '.[]' | while read -r C; do
+                    NAME=$(echo "$C" | jq -r '.name'); EXP=$(echo "$C" | jq -r '.exp'); [ "$EXP" = "null" ] && continue
                     EXP_EPOCH=$(date -u -d "$EXP" +%s 2>/dev/null || echo 0); [ "$EXP_EPOCH" = "0" ] && continue
-                    DAYS=$(( (EXP_EPOCH - NOW) / 86400 ))
-                    if [ "$DAYS" -lt 0 ]; then
-                      echo "- WARNING: EXPIRED cert ${VAULT}/${NAME} ($(( -DAYS ))d ago)" >> "$(reportFile)"
-                    elif [ "$DAYS" -lt "${{ parameters.certExpiryWarningDays }}" ]; then
-                      echo "- WARNING: cert ${VAULT}/${NAME} expires in ${DAYS}d" >> "$(reportFile)"
-                    fi
+                    DAYS=$(( (EXP_EPOCH - NOW) / 86400 )); STATUS=OK
+                    [ "$DAYS" -lt 0 ] && STATUS=EXPIRED
+                    [ "$DAYS" -ge 0 ] && [ "$DAYS" -lt "${{ parameters.certExpiryWarningDays }}" ] && STATUS=EXPIRING
+                    jq -rn --arg v "$VAULT" --arg n "$NAME" --arg d "$DAYS" --arg s "$STATUS" '[$v,$n,($d|tonumber),$s]|@csv' >> "$CSV"
+                    [ "$STATUS" != "OK" ] && echo "Cert ${VAULT}/${NAME}: ${STATUS} (${DAYS}d)" >> "$(warnings)" || true
                   done
                 done
+                jq -rn --arg s "$(grep -q 'EXPIR' "$(warnings)" && echo WARNING || echo OK)" '["Certificates","expiry scan",$s]|@csv' >> "$(workDir)/00_Summary.csv"
 
-          # ── STEP 10 — Weekly cost (this week vs prior week) ───────────────
+          # ── STEP 10 — Weekly cost ─────────────────────────────────────────
           - task: AzureCLI@2
             displayName: 10. Weekly cost
             continueOnError: true
@@ -260,24 +281,24 @@ stages:
               inlineScript: |
                 set -uo pipefail
                 az account set -s $(subscriptionId)
-                THIS_END=$(date -u -d "yesterday"   +%F);  THIS_START=$(date -u -d "8 days ago"  +%F)
-                PRIOR_END=$(date -u -d "9 days ago"  +%F);  PRIOR_START=$(date -u -d "15 days ago" +%F)
-                # az rest avoids the deprecated 'costmanagement' CLI extension.
+                THIS_END=$(date -u -d "yesterday" +%F); THIS_START=$(date -u -d "8 days ago" +%F)
+                PRIOR_END=$(date -u -d "9 days ago" +%F); PRIOR_START=$(date -u -d "15 days ago" +%F)
                 cost() { az rest --method POST \
                   --url "https://management.azure.com/subscriptions/$(subscriptionId)/providers/Microsoft.CostManagement/query?api-version=2023-11-01" \
                   --body "{\"type\":\"ActualCost\",\"timeframe\":\"Custom\",\"timePeriod\":{\"from\":\"$1\",\"to\":\"$2\"},\"dataset\":{\"granularity\":\"None\",\"aggregation\":{\"totalCost\":{\"name\":\"Cost\",\"function\":\"Sum\"}}}}" \
                   --query "properties.rows[0][0]" -o tsv; }
                 THIS=$(cost "$THIS_START" "$THIS_END"); PRIOR=$(cost "$PRIOR_START" "$PRIOR_END")
-                if [ -z "$THIS" ] || [ -z "$PRIOR" ]; then
-                  echo "- WARNING: cost query returned no data." >> "$(reportFile)"
-                else
-                  printf -- "- Cost: this week \$%.2f | prior \$%.2f\n" "$THIS" "$PRIOR" >> "$(reportFile)"
-                  awk -v c="$THIS" -v p="$PRIOR" -v t="${{ parameters.costIncreasePercentThreshold }}" \
-                    'BEGIN{exit (p>0 && (c-p)/p*100>t)?0:1}' \
-                    && printf -- "  - WARNING: cost up %.1f%% week-over-week.\n" "$(awk -v c="$THIS" -v p="$PRIOR" 'BEGIN{print (c-p)/p*100}')" >> "$(reportFile)" || true
+                CSV="$(workDir)/09_Weekly_Cost.csv"; jq -rn '["Period","Cost"]|@csv' > "$CSV"
+                jq -rn --arg p "This week ($THIS_START..$THIS_END)"  --arg c "${THIS:-0}"  '[$p,($c|tonumber)]|@csv' >> "$CSV"
+                jq -rn --arg p "Prior week ($PRIOR_START..$PRIOR_END)" --arg c "${PRIOR:-0}" '[$p,($c|tonumber)]|@csv' >> "$CSV"
+                STATUS=OK; R="this \$$(printf '%.2f' "${THIS:-0}") vs prior \$$(printf '%.2f' "${PRIOR:-0}")"
+                if awk -v c="${THIS:-0}" -v p="${PRIOR:-0}" -v t="${{ parameters.costIncreasePercentThreshold }}" 'BEGIN{exit (p>0 && (c-p)/p*100>t)?0:1}'; then
+                  STATUS=WARNING; PCT=$(awk -v c="$THIS" -v p="$PRIOR" 'BEGIN{printf "%.1f",(c-p)/p*100}')
+                  R="$R (+${PCT}%)"; echo "Cost up ${PCT}% week-over-week" >> "$(warnings)"
                 fi
+                jq -rn --arg r "$R" --arg s "$STATUS" '["Weekly Cost",$r,$s]|@csv' >> "$(workDir)/00_Summary.csv"
 
-          # ── STEP 11 — Defender secure score ───────────────────────────────
+          # ── STEP 11 — Secure score ────────────────────────────────────────
           - task: AzureCLI@2
             displayName: 11. Secure score
             continueOnError: true
@@ -289,13 +310,12 @@ stages:
                 set -uo pipefail
                 az account set -s $(subscriptionId)
                 PCT=$(az security secure-scores show --name ascScore -o json 2>/dev/null | jq -r '.score.percentage // empty')
-                if [ -n "$PCT" ]; then
-                  echo "- Secure score: $(awk -v p="$PCT" 'BEGIN{printf "%.0f",p*100}')%" >> "$(reportFile)"
-                else
-                  echo "- Secure score: unavailable (Defender plan / permissions)." >> "$(reportFile)"
-                fi
+                CSV="$(workDir)/10_Secure_Score.csv"; jq -rn '["Metric","Value"]|@csv' > "$CSV"
+                if [ -n "$PCT" ]; then VAL="$(awk -v p="$PCT" 'BEGIN{printf "%.0f%%",p*100}')"; else VAL="unavailable"; fi
+                jq -rn --arg v "$VAL" '["Secure Score",$v]|@csv' >> "$CSV"
+                jq -rn --arg r "$VAL" '["Secure Score",$r,"OK"]|@csv' >> "$(workDir)/00_Summary.csv"
 
-          # ── STEP 12 — AKS pods + node metrics ─────────────────────────────
+          # ── STEP 12 — AKS pods + nodes ────────────────────────────────────
           - task: Kubernetes@1
             displayName: 12a. AKS login
             continueOnError: true
@@ -305,35 +325,53 @@ stages:
               command: login
           - bash: |
               set -uo pipefail
-              echo -e "\n## AKS" >> "$(reportFile)"
               BAD=$(kubectl get pods -A --no-headers 2>/dev/null | grep -Ev 'Running|Completed' || true)
-              if [ -n "$BAD" ]; then
-                echo "- WARNING: pods not Running/Completed:" >> "$(reportFile)"
-                printf '```\n%s\n```\n' "$BAD" >> "$(reportFile)"
-              else
-                echo "- All pods Running/Completed." >> "$(reportFile)"
-              fi
-              NODES=$(kubectl top nodes --no-headers 2>/dev/null || true)   # cols: NAME CPU CPU% MEM MEM%
-              if [ -n "$NODES" ]; then
-                echo "$NODES" | awk 'NF{printf "- Node %s CPU:%s mem:%s\n",$1,$3,$5}' >> "$(reportFile)"
-              else
-                echo "- WARNING: kubectl top nodes returned no data (metrics-server down?)." >> "$(reportFile)"
-              fi
+              { echo 'Namespace,Pod,Status'; [ -n "$BAD" ] && echo "$BAD" | awk 'NF{print $1","$2","$4}'; } > "$(workDir)/11_AKS_Pods.csv"
+              NODES=$(kubectl top nodes --no-headers 2>/dev/null || true)   # NAME CPU CPU% MEM MEM%
+              { echo 'Node,CPUcores,CPUpct,Memory,Mempct'; [ -n "$NODES" ] && echo "$NODES" | awk 'NF{print $1","$2","$3","$4","$5}'; } > "$(workDir)/12_AKS_Nodes.csv"
+              if [ -n "$BAD" ]; then S=WARNING; echo "Pods not Running/Completed found" >> "$(warnings)"; else S=OK; fi
+              jq -rn --arg s "$S" '["AKS Pods/Nodes","cluster health scan",$s]|@csv' >> "$(workDir)/00_Summary.csv"
             displayName: 12b. AKS pod/node check
             continueOnError: true
 
-          # ── STEP 13 — print, publish, upload, notify (always run) ─────────
-          - bash: cat "$(reportFile)"
-            displayName: 13. Print report
+          # ── STEP 13 — combine all CSVs into one multi-tab workbook ────────
+          - bash: |
+              set -euo pipefail
+              WORKDIR="$(workDir)" WORKBOOK="$(workbook)" python3 - <<'PY'
+              import csv, glob, os
+              from openpyxl import Workbook
+              from openpyxl.styles import Font
+              d, out = os.environ['WORKDIR'], os.environ['WORKBOOK']
+              def cast(v):
+                  for f in (int, float):
+                      try: return f(v)
+                      except (ValueError, TypeError): pass
+                  return v
+              wb = Workbook(); wb.remove(wb.active)
+              for path in sorted(glob.glob(os.path.join(d, '*.csv'))):
+                  base = os.path.splitext(os.path.basename(path))[0]              # e.g. 01_Log_Ingestion
+                  name = (base.split('_', 1)[1].replace('_', ' ') if '_' in base else base)[:31]
+                  ws = wb.create_sheet(name)
+                  with open(path, newline='') as f:
+                      for row in csv.reader(f):
+                          ws.append([cast(c) for c in row])
+                  ws.freeze_panes = 'A2'
+                  for cell in ws[1]:
+                      cell.font = Font(bold=True)
+              wb.save(out)
+              print('Wrote', out, '->', wb.sheetnames)
+              PY
+            displayName: 13. Build Excel workbook (one tab per check)
             condition: always()
 
-          - publish: $(reportFile)
+          # ── STEP 14 — publish + upload to blob: sa18436/preflight ─────────
+          - publish: $(workbook)
             artifact: preflight-report
-            displayName: 14. Publish artifact
+            displayName: 14. Publish workbook artifact
             condition: always()
 
           - task: AzureCLI@2
-            displayName: 15. Upload to Azure Files (sa18436)
+            displayName: 15. Upload workbook to blob (sa18436/preflight)
             condition: always()
             inputs:
               azureSubscription: $(AZURE_SERVICE_CONNECTION)
@@ -341,16 +379,19 @@ stages:
               scriptLocation: inlineScript
               inlineScript: |
                 set -euo pipefail
-                [ -f "$(reportFile)" ] || { echo "No report — nothing to upload."; exit 0; }
-                KEY=$(az storage account keys list --account-name sa18436 -g $(resourceGroup) --query "[0].value" -o tsv)
-                az storage file upload --account-name sa18436 --account-key "$KEY" \
-                  --share-name fileshare --source "$(reportFile)" \
-                  --path "dumps/preflight-report-$(date -u '+%Y-%m-%d-%H%M').md"
+                [ -f "$(workbook)" ] || { echo "No workbook — nothing to upload."; exit 0; }
+                KEY=$(az storage account keys list --account-name $(storageAccount) -g $(resourceGroup) --query "[0].value" -o tsv)
+                az storage container create --account-name $(storageAccount) --account-key "$KEY" --name $(blobContainer) --only-show-errors -o none
+                az storage blob upload --account-name $(storageAccount) --account-key "$KEY" \
+                  --container-name $(blobContainer) --file "$(workbook)" \
+                  --name "preflight-report-$(date -u '+%Y-%m-%d-%H%M').xlsx" --overwrite -o none
+                echo "Uploaded to $(storageAccount)/$(blobContainer)."
 
+          # ── STEP 16 — Google Chat notification ────────────────────────────
           - bash: |
               set -uo pipefail
               [ -z "${GCHAT_WEBHOOK_URL:-}" ] && { echo "No webhook — skipping."; exit 0; }
-              WARN=$(grep "WARNING:" "$(reportFile)" | sed -E 's/^\s*-?\s*WARNING:\s*//' || true)
+              WARN=$(cat "$(warnings)" 2>/dev/null || true)
               COUNT=$(printf '%s\n' "$WARN" | grep -c . || true)
               if [ "$COUNT" -eq 0 ]; then
                 SECTION=$(jq -n '{header:"Status",widgets:[{decoratedText:{startIcon:{materialIcon:{name:"check_circle"}},text:"<b>No anomalies this week.</b>"}}]}')
