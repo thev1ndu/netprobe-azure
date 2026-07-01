@@ -1,26 +1,3 @@
-# ──────────────────────────────────────────────────────────────────────────
-# Asgardeo Weekly Pre-Flight Check
-#
-# OUTPUT: one CSV per check in $(workDir). No xlsx. All CSVs are published as a
-#   pipeline artifact AND uploaded to blob  sa18436 / preflight  under a
-#   timestamped folder.
-#
-# WHY LOG ANALYTICS SHOWED 0 ROWS BEFORE:
-#   Queries ended in `|| echo '[]'`, hiding every error (403, missing table…)
-#   as "0 data". Each check now reports exactly one status:
-#     OK | WARNING | ALERT | FAILED (query/cmd errored) | EMPTY (ran, 0 rows) | SKIP
-#   STEP 2 probes auth with `print probe=1` (needs no table), so a PERMISSION
-#   problem (FAILED) is distinguishable from a genuine NO-DATA window (EMPTY).
-#   If the LA checks come back FAILED, grant the service-connection SP
-#   "Log Analytics Reader" (or "Monitoring Reader") on the workspace / RG.
-#
-# QUERIES: taken from the canonical card.sh pipeline (AzureDiagnostics latency,
-#   full IS error-tenant filter set, top traffic tenants, secure-score fallback).
-#
-# GOOGLE CHAT: one card listing Anomalies + Failed + Skipped checks by name,
-#   with OK/Warn/Fail/Skip counts in the subtitle.
-# ──────────────────────────────────────────────────────────────────────────
-
 trigger: none
 
 schedules:
@@ -98,12 +75,16 @@ jobs:
           export LOOKBACK=${{ parameters.lookbackDays }}
           EOF
           cat >> "$(lib)" <<'EOF'
+          # NOTE: kql returns its output in the global QUERY_OUT (NOT via stdout).
+          #   Callers must invoke it directly — `kql '...'; DATA="$QUERY_OUT"` —
+          #   never as `DATA=$(kql ...)`, because a command-substitution subshell
+          #   would discard QUERY_OK/QUERY_ERR and trip `set -u` in the parent.
           kql() {
-            local err out; err=$(mktemp); QUERY_OK=1; QUERY_ERR=""
-            if out=$(az monitor log-analytics query -w "$WORKSPACE_ID" --timespan "P${LOOKBACK}D" --analytics-query "$1" -o json 2>"$err"); then
-              printf '%s' "$out"
+            local err; err=$(mktemp); QUERY_OK=1; QUERY_ERR=""; QUERY_OUT='[]'
+            if QUERY_OUT=$(az monitor log-analytics query -w "$WORKSPACE_ID" --timespan "P${LOOKBACK}D" --analytics-query "$1" -o json 2>"$err"); then
+              :
             else
-              QUERY_OK=0; QUERY_ERR=$(tr '\n' ' ' <"$err" | tr '"' "'" | head -c 200); printf '[]'
+              QUERY_OK=0; QUERY_ERR=$(tr '\n' ' ' <"$err" | tr '"' "'" | head -c 200); QUERY_OUT='[]'
             fi
             rm -f "$err"
           }
@@ -130,7 +111,7 @@ jobs:
               summary "Auth: subscription" "$(tr '\n' ' ' </tmp/se | head -c 150)" FAILED
               note "Cannot set subscription $(subscriptionId) — SP has no access."
             fi
-            kql 'print probe=1' >/dev/null
+            kql 'print probe=1'
             if [ "$QUERY_OK" = 1 ]; then
               summary "Auth: Log Analytics" "query API reachable" OK
             else
@@ -149,9 +130,10 @@ jobs:
           inlineScript: |
             set -uo pipefail
             source "$(lib)"; az account set -s $(subscriptionId) 2>/dev/null || true
-            DATA=$(kql 'Usage_CL
+            kql 'Usage_CL
               | summarize TotalVolumeGB = sum(Quantity_d / 1000.) by bin(TimeGenerated, 1d)
-              | project Day = TimeGenerated, TotalVolumeGB | order by Day asc')
+              | project Day = TimeGenerated, TotalVolumeGB | order by Day asc'
+            DATA="$QUERY_OUT"
             echo "$DATA" | jq -r '["Day","VolumeGB"],(.[]|[((.Day // .TimeGenerated)|tostring)[:10],(.TotalVolumeGB|tonumber)])|@csv' > "$WORKDIR/01_Log_Ingestion.csv"
             if [ "$QUERY_OK" = 0 ]; then summary "Log Ingestion" "$QUERY_ERR" FAILED; note "Log Ingestion FAILED: $QUERY_ERR"
             elif [ "$(echo "$DATA" | jq 'length')" = 0 ]; then summary "Log Ingestion" "query ran, 0 rows" EMPTY; note "Log Ingestion: 0 rows (no data in window or table empty)."
@@ -173,9 +155,10 @@ jobs:
           inlineScript: |
             set -uo pipefail
             source "$(lib)"; az account set -s $(subscriptionId) 2>/dev/null || true
-            DATA=$(kql 'FrontdoorAccessLog_CL
+            kql 'FrontdoorAccessLog_CL
               | summarize Requests = count() by bin(TimeGenerated, 1d)
-              | project Day = TimeGenerated, Requests | order by Day asc')
+              | project Day = TimeGenerated, Requests | order by Day asc'
+            DATA="$QUERY_OUT"
             echo "$DATA" | jq -r '["Day","Requests"],(.[]|[((.Day // .TimeGenerated)|tostring)[:10],(.Requests)])|@csv' > "$WORKDIR/02_Frontdoor_Traffic.csv"
             if [ "$QUERY_OK" = 0 ]; then summary "Frontdoor Traffic" "$QUERY_ERR" FAILED; note "Frontdoor Traffic FAILED: $QUERY_ERR"
             elif [ "$(echo "$DATA" | jq 'length')" = 0 ]; then summary "Frontdoor Traffic" "query ran, 0 rows" EMPTY
@@ -195,14 +178,15 @@ jobs:
           inlineScript: |
             set -uo pipefail
             source "$(lib)"; az account set -s $(subscriptionId) 2>/dev/null || true
-            DATA=$(kql 'FrontdoorAccessLog_CL
+            kql 'FrontdoorAccessLog_CL
               | extend reqUri = tostring(requestUri_s)
               | extend tenant_from_path = extract(@"/t/([^/]+)", 1, reqUri)
               | extend custom_domain = extract(@"https?://([^/:]+)", 1, reqUri)
               | extend tenant = case(isnotempty(tenant_from_path), tenant_from_path,
                   isnotempty(custom_domain) and custom_domain !contains "asgardeo.io", custom_domain, "")
               | where isnotempty(tenant)
-              | summarize request_count = count() by tenant | top 5 by request_count desc')
+              | summarize request_count = count() by tenant | top 5 by request_count desc'
+            DATA="$QUERY_OUT"
             echo "$DATA" | jq -r '["Tenant","RequestCount"],(.[]|[.tenant,.request_count])|@csv' > "$WORKDIR/03_Top_Traffic_Tenants.csv"
             if [ "$QUERY_OK" = 0 ]; then summary "Top Traffic Tenants" "$QUERY_ERR" FAILED; note "Top Traffic Tenants FAILED: $QUERY_ERR"
             else
@@ -221,12 +205,13 @@ jobs:
           inlineScript: |
             set -uo pipefail
             source "$(lib)"; az account set -s $(subscriptionId) 2>/dev/null || true
-            DATA=$(kql 'ContainerLog_CL
+            kql 'ContainerLog_CL
               | join kind=inner (KubePodInventory_CL | project ContainerID_s, PodName = Name_s | distinct *) on ContainerID_s
               | project TimeGenerated, LogEntry_s
               | where LogEntry_s has_cs ": ERROR"
               | summarize Count = count() by bin(TimeGenerated, 1d)
-              | project Day = TimeGenerated, Count | order by Day asc')
+              | project Day = TimeGenerated, Count | order by Day asc'
+            DATA="$QUERY_OUT"
             echo "$DATA" | jq -r '["Day","ErrorCount"],(.[]|[((.Day // .TimeGenerated)|tostring)[:10],(.Count)])|@csv' > "$WORKDIR/04_IS_Errors.csv"
             if [ "$QUERY_OK" = 0 ]; then summary "IS Errors" "$QUERY_ERR" FAILED; note "IS Errors FAILED: $QUERY_ERR"
             elif [ "$(echo "$DATA" | jq 'length')" = 0 ]; then summary "IS Errors" "query ran, 0 rows" EMPTY
@@ -248,7 +233,7 @@ jobs:
           inlineScript: |
             set -uo pipefail
             source "$(lib)"; az account set -s $(subscriptionId) 2>/dev/null || true
-            DATA=$(kql 'let paramPodNamePrefix = "wso2is-deployment";
+            kql 'let paramPodNamePrefix = "wso2is-deployment";
               let errorRegex = ".*iam-cloud-.* : ERROR {.*} .*";
               ContainerLog_CL
               | join kind=inner (KubePodInventory_CL | project ContainerID_s, PodName = Name_s
@@ -261,7 +246,8 @@ jobs:
               | project TimeGenerated, LogEntry_s
               | parse LogEntry_s with * "Tenant: [" TenantName "]" *
               | where isnotempty(TenantName)
-              | summarize LogCount = count() by TenantName | top 5 by LogCount desc')
+              | summarize LogCount = count() by TenantName | top 5 by LogCount desc'
+            DATA="$QUERY_OUT"
             echo "$DATA" | jq -r '["TenantName","LogCount"],(.[]|[.TenantName,.LogCount])|@csv' > "$WORKDIR/05_Top_Error_Tenants.csv"
             if [ "$QUERY_OK" = 0 ]; then summary "Top Error Tenants" "$QUERY_ERR" FAILED; note "Top Error Tenants FAILED: $QUERY_ERR"
             else
@@ -280,12 +266,13 @@ jobs:
           inlineScript: |
             set -uo pipefail
             source "$(lib)"; az account set -s $(subscriptionId) 2>/dev/null || true
-            DATA=$(kql 'AzureDiagnostics
+            kql 'AzureDiagnostics
               | where isnotempty(timeTaken_s) or isnotempty(httpStatusCode_s)
               | extend tt = todouble(timeTaken_s)
               | where isnotempty(tt)
               | summarize AvgSec = round(avg(tt), 3) by Endpoint = tostring(requestUri_s)
-              | top 5 by AvgSec desc')
+              | top 5 by AvgSec desc'
+            DATA="$QUERY_OUT"
             echo "$DATA" | jq -r '["Endpoint","AvgSeconds"],(.[]|[.Endpoint,(.AvgSec|tonumber)])|@csv' > "$WORKDIR/06_API_Latency.csv"
             if [ "$QUERY_OK" = 0 ]; then summary "API Latency" "$QUERY_ERR" FAILED; note "API Latency FAILED: $QUERY_ERR"
             elif [ "$(echo "$DATA" | jq 'length')" = 0 ]; then summary "API Latency" "query ran, 0 rows" EMPTY
