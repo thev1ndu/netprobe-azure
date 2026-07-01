@@ -3,8 +3,10 @@ trigger: none
 schedules:
   - cron: "0 2 * * 1"
     displayName: Weekly pre-flight (Mon 02:00 UTC)
-    branches: { include: [ main ] }
     always: true
+    branches:
+      include:
+        - vmss
 
 parameters:
   - name: lookbackDays
@@ -31,7 +33,8 @@ parameters:
 
 variables:
   AZURE_SERVICE_CONNECTION: thevindu-rnd-sc
-  workDir:              $(Build.ArtifactStagingDirectory)/checks     # one CSV per check
+  workDir:              $(Build.ArtifactStagingDirectory)/checks     # one CSV per check (intermediate, not published)
+  reportDir:            $(Build.ArtifactStagingDirectory)/report     # holds only the published .xlsx
   warnings:             $(Build.ArtifactStagingDirectory)/warnings.txt
   lib:                  $(Build.ArtifactStagingDirectory)/lib.sh     # shared bash helpers
   subscriptionId:       '38785beb-5019-4896-8679-3d41ddacc4b1'
@@ -49,7 +52,7 @@ jobs:
     pool:
       name: ${{ parameters.agentPool }}
     steps:
-      - checkout: none
+      - checkout: self   # need build-xlsx.py on the agent to render the report
 
       # ── STEP 0 — tools on the agent (the original `az not found` fix) ──────
       - bash: |
@@ -70,7 +73,10 @@ jobs:
           fi
           command -v jq      >/dev/null 2>&1 || retry sudo bash -c 'apt-get update -y && apt-get install -y jq'      || { echo "##[error]Could not install jq.";      exit 1; }
           command -v python3 >/dev/null 2>&1 || retry sudo bash -c 'apt-get update -y && apt-get install -y python3' || { echo "##[error]Could not install python3."; exit 1; }
-          echo "Versions:"; az version 2>/dev/null | head -n 20 || true; jq --version; python3 --version
+          # openpyxl renders the multi-sheet .xlsx report in step 15.
+          python3 -c 'import openpyxl' 2>/dev/null || retry sudo bash -c 'apt-get update -y && apt-get install -y python3-pip' || true
+          python3 -c 'import openpyxl' 2>/dev/null || retry pip3 install --quiet openpyxl || { echo "##[error]Could not install openpyxl."; exit 1; }
+          echo "Versions:"; az version 2>/dev/null | head -n 20 || true; jq --version; python3 --version; python3 -c 'import openpyxl; print("openpyxl", openpyxl.__version__)'
         displayName: 0. Install az + jq + python3
 
       # ── STEP 1 — output dir, Summary header, and shared helpers ───────────
@@ -144,7 +150,8 @@ jobs:
           inlineScript: |
             set -uo pipefail
             source "$(lib)"; az account set -s $(subscriptionId) 2>/dev/null || true
-            kql 'Usage_CL
+            # Seeded via seed-sample-logs.sh — mirrors built-in Usage (Quantity -> Quantity_d).
+            kql 'PreflightUsage_CL
               | summarize TotalVolumeGB = sum(Quantity_d / 1000.) by bin(TimeGenerated, 1d)
               | project Day = TimeGenerated, TotalVolumeGB | order by Day asc'
             DATA="$QUERY_OUT"
@@ -169,7 +176,9 @@ jobs:
           inlineScript: |
             set -uo pipefail
             source "$(lib)"; az account set -s $(subscriptionId) 2>/dev/null || true
-            kql 'FrontdoorAccessLog_CL
+            # Seeded via seed-sample-logs.sh — mirrors AzureDiagnostics (Category -> Category_s).
+            kql 'PreflightAzureDiagnostics_CL
+              | where Category_s =~ "FrontdoorAccessLog"
               | summarize Requests = count() by bin(TimeGenerated, 1d)
               | project Day = TimeGenerated, Requests | order by Day asc'
             DATA="$QUERY_OUT"
@@ -192,7 +201,9 @@ jobs:
           inlineScript: |
             set -uo pipefail
             source "$(lib)"; az account set -s $(subscriptionId) 2>/dev/null || true
-            kql 'FrontdoorAccessLog_CL
+            # Seeded via seed-sample-logs.sh — mirrors AzureDiagnostics (Category -> Category_s).
+            kql 'PreflightAzureDiagnostics_CL
+              | where Category_s =~ "FrontdoorAccessLog"
               | extend reqUri = tostring(requestUri_s)
               | extend tenant_from_path = extract(@"/t/([^/]+)", 1, reqUri)
               | extend custom_domain = extract(@"https?://([^/:]+)", 1, reqUri)
@@ -219,8 +230,10 @@ jobs:
           inlineScript: |
             set -uo pipefail
             source "$(lib)"; az account set -s $(subscriptionId) 2>/dev/null || true
-            kql 'ContainerLog_CL
-              | join kind=inner (KubePodInventory_CL | project ContainerID_s, PodName = Name_s | distinct *) on ContainerID_s
+            # Seeded via seed-sample-logs.sh — mirrors ContainerLog + KubePodInventory
+            # (ContainerID -> ContainerID_s, Name -> Name_s, LogEntry -> LogEntry_s).
+            kql 'PreflightContainerLog_CL
+              | join kind=inner (PreflightKubePodInventory_CL | project ContainerID_s, PodName = Name_s | distinct *) on ContainerID_s
               | project TimeGenerated, LogEntry_s
               | where LogEntry_s has_cs ": ERROR"
               | summarize Count = count() by bin(TimeGenerated, 1d)
@@ -247,10 +260,12 @@ jobs:
           inlineScript: |
             set -uo pipefail
             source "$(lib)"; az account set -s $(subscriptionId) 2>/dev/null || true
+            # Seeded via seed-sample-logs.sh — mirrors ContainerLog + KubePodInventory
+            # (ContainerID -> ContainerID_s, Name -> Name_s, LogEntry -> LogEntry_s).
             kql 'let paramPodNamePrefix = "wso2is-deployment";
               let errorRegex = ".*iam-cloud-.* : ERROR {.*} .*";
-              ContainerLog_CL
-              | join kind=inner (KubePodInventory_CL | project ContainerID_s, PodName = Name_s
+              PreflightContainerLog_CL
+              | join kind=inner (PreflightKubePodInventory_CL | project ContainerID_s, PodName = Name_s
                   | where PodName contains paramPodNamePrefix | distinct *) on ContainerID_s
               | where LogEntry_s has_cs "ERROR"
               | where LogEntry_s matches regex errorRegex
@@ -280,11 +295,11 @@ jobs:
           inlineScript: |
             set -uo pipefail
             source "$(lib)"; az account set -s $(subscriptionId) 2>/dev/null || true
-            kql 'AzureDiagnostics
-              | where isnotempty(timeTaken_s) or isnotempty(httpStatusCode_s)
-              | extend tt = todouble(timeTaken_s)
-              | where isnotempty(tt)
-              | summarize AvgSec = round(avg(tt), 3) by Endpoint = tostring(requestUri_s)
+            # Seeded via seed-sample-logs.sh — mirrors AzureDiagnostics (timeTaken_d / requestUri_s unchanged).
+            kql 'PreflightAzureDiagnostics_CL
+              | where isnotnull(timeTaken_d)
+              | summarize AvgSec = round(avg(timeTaken_d), 3) by Endpoint = tostring(requestUri_s)
+              | where isnotempty(Endpoint)
               | top 5 by AvgSec desc'
             DATA="$QUERY_OUT"
             echo "$DATA" | jq -r '["Endpoint","AvgSeconds"],(.[]|[.Endpoint,(.AvgSec|tonumber)])|@csv' > "$WORKDIR/06_API_Latency.csv"
@@ -445,15 +460,26 @@ jobs:
         displayName: 14b. AKS pod/node check
         continueOnError: true
 
-      # ── STEP 15 — publish CSVs as a pipeline artifact ─────────────────────
-      - publish: $(workDir)
-        artifact: preflight-csv
-        displayName: 15. Publish CSV artifact
+      # ── STEP 15 — render CSVs into one multi-sheet .xlsx report ────────────
+      - bash: |
+          set -euo pipefail
+          ls "$(workDir)"/*.csv >/dev/null 2>&1 || { echo "No CSVs — nothing to render."; exit 0; }
+          mkdir -p "$(reportDir)"
+          REPORT="$(reportDir)/preflight-report-$(date -u '+%Y-%m-%d-%H%M').xlsx"
+          python3 "$(System.DefaultWorkingDirectory)/build-xlsx.py" "$(workDir)" "$REPORT"
+          echo "##vso[task.setvariable variable=reportPath]$REPORT"
+        displayName: 15. Build .xlsx report
         condition: always()
 
-      # ── STEP 16 — upload every CSV to blob: sa18436/preflight ─────────────
+      # ── STEP 16 — publish the .xlsx report as a pipeline artifact ─────────
+      - publish: $(reportDir)
+        artifact: preflight-report
+        displayName: 16. Publish report artifact
+        condition: always()
+
+      # ── STEP 17 — upload the .xlsx report to blob: sa18436/preflight ──────
       - task: AzureCLI@2
-        displayName: 16. Upload CSVs to blob (sa18436/preflight)
+        displayName: 17. Upload report to blob (sa18436/preflight)
         condition: always()
         inputs:
           azureSubscription: $(AZURE_SERVICE_CONNECTION)
@@ -461,17 +487,17 @@ jobs:
           scriptLocation: inlineScript
           inlineScript: |
             set -euo pipefail
-            ls "$(workDir)"/*.csv >/dev/null 2>&1 || { echo "No CSVs — nothing to upload."; exit 0; }
+            [ -n "${REPORTPATH:-}" ] && [ -f "$REPORTPATH" ] || { echo "No .xlsx report — nothing to upload."; exit 0; }
             KEY=$(az storage account keys list --account-name $(storageAccount) -g $(resourceGroup) --query "[0].value" -o tsv)
             az storage container create --account-name $(storageAccount) --account-key "$KEY" --name $(blobContainer) --only-show-errors -o none
             PREFIX="preflight-$(date -u '+%Y-%m-%d-%H%M')"
-            for f in "$(workDir)"/*.csv; do
-              az storage blob upload --account-name $(storageAccount) --account-key "$KEY" \
-                --container-name $(blobContainer) --file "$f" --name "${PREFIX}/$(basename "$f")" --overwrite -o none
-            done
-            echo "Uploaded $(ls "$(workDir)"/*.csv | wc -l) CSV(s) to $(storageAccount)/$(blobContainer)/${PREFIX}/"
+            az storage blob upload --account-name $(storageAccount) --account-key "$KEY" \
+              --container-name $(blobContainer) --file "$REPORTPATH" --name "${PREFIX}/$(basename "$REPORTPATH")" --overwrite -o none
+            echo "Uploaded $(basename "$REPORTPATH") to $(storageAccount)/$(blobContainer)/${PREFIX}/"
+        env:
+          REPORTPATH: $(reportPath)
 
-      # ── STEP 17 — Google Chat: anomalies + FAILED + SKIPPED by name ───────
+      # ── STEP 18 — Google Chat: anomalies + FAILED + SKIPPED by name ───────
       - bash: |
           set -uo pipefail
           [ -z "${GCHAT_WEBHOOK_URL:-}" ] && { echo "No webhook — skipping."; exit 0; }
@@ -511,7 +537,7 @@ jobs:
               ])}}]}')
           curl -sS -H "Content-Type: application/json" -d "$PAYLOAD" "$GCHAT_WEBHOOK_URL" >/dev/null \
             && echo "Posted card to Google Chat."
-        displayName: 17. Notify Google Chat
+        displayName: 18. Notify Google Chat
         condition: always()
         env:
           GCHAT_WEBHOOK_URL: $(GCHAT_WEBHOOK_URL)
