@@ -77,8 +77,43 @@ jobs:
           # openpyxl renders the multi-sheet .xlsx report in step 15.
           python3 -c 'import openpyxl' 2>/dev/null || retry sudo bash -c 'apt-get update -y && apt-get install -y python3-pip' || true
           python3 -c 'import openpyxl' 2>/dev/null || retry pip3 install --quiet openpyxl || { echo "##[error]Could not install openpyxl."; exit 1; }
-          echo "Versions:"; az version 2>/dev/null | head -n 20 || true; jq --version; python3 --version; python3 -c 'import openpyxl; print("openpyxl", openpyxl.__version__)'
-        displayName: 0. Install az + jq + python3
+
+          # ── PowerShell (pwsh) + Az modules ────────────────────────────────
+          # Every AzurePowerShell@5 task below runs on pwsh. A bare VMSS agent
+          # has neither pwsh nor the Az modules, so those tasks (and their
+          # cleanup) failed with "Unable to locate executable file: 'pwsh'".
+          # Install both here so the checks can actually run.
+          if ! command -v pwsh >/dev/null 2>&1; then
+            echo "PowerShell (pwsh) not found — installing…"
+            # Primary: Microsoft's apt repo for this Ubuntu release. Fallback: snap.
+            retry sudo bash -c '
+              set -e
+              . /etc/os-release
+              curl -sSL "https://packages.microsoft.com/config/ubuntu/${VERSION_ID}/packages-microsoft-prod.deb" -o /tmp/pmc.deb
+              dpkg -i /tmp/pmc.deb
+              apt-get update -y
+              apt-get install -y powershell
+            ' || retry sudo snap install powershell --classic \
+              || { echo "##[error]Could not install PowerShell (pwsh)."; exit 1; }
+          fi
+          # Install only the Az submodules the checks call (not the full Az
+          # meta-module) to keep this fast. AllUsers scope lands them in the
+          # default PSModulePath so the AzurePowerShell@5 tasks discover them.
+          retry sudo pwsh -NoProfile -NonInteractive -Command '
+            $ErrorActionPreference = "Stop"
+            Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+            $mods = "Az.Accounts","Az.OperationalInsights","Az.Monitor","Az.Sql",
+                    "Az.Storage","Az.KeyVault","Az.Security","Az.CostManagement"
+            foreach ($m in $mods) {
+              if (-not (Get-Module -ListAvailable -Name $m)) {
+                Write-Host "Installing $m…"
+                Install-Module $m -Scope AllUsers -Force -AllowClobber -Repository PSGallery
+              }
+            }
+          ' || { echo "##[error]Could not install Az PowerShell modules."; exit 1; }
+
+          echo "Versions:"; az version 2>/dev/null | head -n 20 || true; jq --version; python3 --version; python3 -c 'import openpyxl; print("openpyxl", openpyxl.__version__)'; pwsh --version
+        displayName: 0. Install az + jq + python3 + pwsh
 
       # ── STEP 1 — output dir, Summary header, and shared helpers ───────────
       #   kql()     runs a query; sets QUERY_OK (1/0) + QUERY_ERR; prints JSON or [].
