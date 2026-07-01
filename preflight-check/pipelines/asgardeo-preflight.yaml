@@ -702,13 +702,32 @@ jobs:
       - bash: |
           set -uo pipefail
           source "$(lib)"
-          BAD=$(kubectl get pods -A --no-headers 2>/dev/null | grep -Ev 'Running|Completed' || true)
-          { echo 'Namespace,Pod,Status'; [ -n "$BAD" ] && echo "$BAD" | awk 'NF{print $1","$2","$4}'; } > "$WORKDIR/12_AKS_Pods.csv"
-          NODES=$(kubectl top nodes --no-headers 2>/dev/null || true)   # NAME CPU CPU% MEM MEM%
-          { echo 'Node,CPUcores,CPUpct,Memory,Mempct'; [ -n "$NODES" ] && echo "$NODES" | awk 'NF{print $1","$2","$3","$4","$5}'; } > "$WORKDIR/13_AKS_Nodes.csv"
-          if [ -z "$NODES" ]; then summary "AKS Pods/Nodes" "kubectl returned nothing (login failed?)" FAILED; note "AKS check FAILED — kubectl unreachable."
-          elif [ -n "$BAD" ]; then summary "AKS Pods/Nodes" "unhealthy pods found" WARNING; note "Pods not Running/Completed found"
-          else summary "AKS Pods/Nodes" "all pods healthy" OK; fi
+
+          # Cluster name from the kubeconfig context set by the Kubernetes@1 login task.
+          AKS_NAME=$(kubectl config current-context 2>/dev/null || echo 'unknown')
+
+          # -o wide appends IP ($7) and NODE ($8) to the default pod columns.
+          PODS=$(kubectl get pods -A -o wide --no-headers 2>/dev/null || true)
+          BAD=$(echo "$PODS" | awk '$4 !~ /^(Running|Completed|Succeeded)$/' || true)
+
+          {
+            echo 'AKSCluster,Namespace,Pod,Status,Node'
+            [ -n "$BAD" ] && echo "$BAD" | awk -v cluster="$AKS_NAME" \
+              'NF { print cluster","$1","$2","$4","$8 }'
+          } > "$WORKDIR/12_AKS_Pods.csv"
+
+          NODES=$(kubectl top nodes --no-headers 2>/dev/null || true)
+          {
+            echo 'Node,CPUcores,CPUpct,Memory,Mempct'
+            [ -n "$NODES" ] && echo "$NODES" | awk 'NF { print $1","$2","$3","$4","$5 }'
+          } > "$WORKDIR/13_AKS_Nodes.csv"
+
+          if   [ -z "$PODS" ];  then summary "AKS Pods/Nodes" "kubectl returned nothing (login failed?)" FAILED
+                                     note "AKS check FAILED — kubectl unreachable."
+          elif [ -n "$BAD" ];   then summary "AKS Pods/Nodes" "unhealthy pods found" WARNING
+                                     note "Pods not Running/Completed found"
+          else                       summary "AKS Pods/Nodes" "all pods healthy" OK
+          fi
         displayName: 14b. AKS pod/node check
         continueOnError: true
 
@@ -722,20 +741,72 @@ jobs:
           python3 - "$(workDir)" "$REPORT" <<'PY'
           import csv, glob, os, sys
           import openpyxl
+          from openpyxl.styles import Font, PatternFill, Alignment
+
           workdir, report = sys.argv[1], sys.argv[2]
-          wb = openpyxl.Workbook(); wb.remove(wb.active)
+
+          wb = openpyxl.Workbook()
+          ws = wb.active
+          ws.title = "Preflight Report"
+
+          # Styles
+          SEC_FILL = PatternFill("solid", fgColor="1F4E79")   # dark blue — section title
+          SEC_FONT = Font(bold=True, color="FFFFFF", size=11)
+          HDR_FILL = PatternFill("solid", fgColor="BDD7EE")   # light blue — column headers
+          HDR_FONT = Font(bold=True, color="1F4E79")
+          ALT_FILL = PatternFill("solid", fgColor="F2F2F2")   # light grey — alternate data rows
+
+          col_widths = {}
+          cur_row = 1
+
           for path in sorted(glob.glob(os.path.join(workdir, "*.csv"))):
-              # Sheet names: max 31 chars, no []:*?/\ — strip the numeric prefix.
-              name = os.path.splitext(os.path.basename(path))[0]
-              name = name.split("_", 1)[-1] if name[:2].isdigit() else name
-              for ch in r'[]:*?/\\':
-                  name = name.replace(ch, " ")
-              ws = wb.create_sheet(name[:31] or "Sheet")
-              with open(path, newline='') as f:
-                  for row in csv.reader(f):
-                      ws.append(row)
+              stem = os.path.splitext(os.path.basename(path))[0]
+              # "01_Log_Ingestion" -> "Log Ingestion"
+              name = stem.split("_", 1)[-1].replace("_", " ") if stem[:2].isdigit() else stem
+
+              with open(path, newline="") as f:
+                  rows = list(csv.reader(f))
+              if not rows:
+                  continue
+
+              ncols = max(len(r) for r in rows)
+
+              # ── Section title: dark blue, merged across all columns ──
+              cell = ws.cell(row=cur_row, column=1, value=name)
+              cell.font = SEC_FONT
+              cell.fill = SEC_FILL
+              cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+              if ncols > 1:
+                  ws.merge_cells(start_row=cur_row, start_column=1,
+                                 end_row=cur_row, end_column=ncols)
+              ws.row_dimensions[cur_row].height = 18
+              cur_row += 1
+
+              # ── Column headers: light blue ──
+              for c, val in enumerate(rows[0], 1):
+                  cell = ws.cell(row=cur_row, column=c, value=val)
+                  cell.font = HDR_FONT
+                  cell.fill = HDR_FILL
+                  col_widths[c] = max(col_widths.get(c, 10), len(str(val)) + 2)
+              cur_row += 1
+
+              # ── Data rows: alternating white / light grey ──
+              for i, data_row in enumerate(rows[1:]):
+                  for c, val in enumerate(data_row, 1):
+                      cell = ws.cell(row=cur_row, column=c, value=val)
+                      if i % 2 == 1:
+                          cell.fill = ALT_FILL
+                      col_widths[c] = max(col_widths.get(c, 10), len(str(val)) + 2)
+                  cur_row += 1
+
+              cur_row += 1  # blank row between sections
+
+          # Auto-size columns (capped at 60 chars)
+          for col_idx, width in col_widths.items():
+              ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = min(width, 60)
+
           wb.save(report)
-          print("Wrote", report, "with", len(wb.sheetnames), "sheet(s)")
+          print("Wrote", report, "—", cur_row - 1, "rows")
           PY
           echo "##vso[task.setvariable variable=reportPath]$REPORT"
         displayName: 15. Build .xlsx report
