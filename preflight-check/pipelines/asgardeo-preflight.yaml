@@ -6,7 +6,7 @@ schedules:
     always: true
     branches:
       include:
-        - vmss
+        - main
 
 parameters:
   - name: lookbackDays
@@ -461,12 +461,30 @@ jobs:
         continueOnError: true
 
       # ── STEP 15 — render CSVs into one multi-sheet .xlsx report ────────────
+      #   Built inline with openpyxl (installed in step 0): one sheet per CSV.
       - bash: |
           set -euo pipefail
           ls "$(workDir)"/*.csv >/dev/null 2>&1 || { echo "No CSVs — nothing to render."; exit 0; }
           mkdir -p "$(reportDir)"
           REPORT="$(reportDir)/preflight-report-$(date -u '+%Y-%m-%d-%H%M').xlsx"
-          python3 "$(System.DefaultWorkingDirectory)/build-xlsx.py" "$(workDir)" "$REPORT"
+          python3 - "$(workDir)" "$REPORT" <<'PY'
+          import csv, glob, os, sys
+          import openpyxl
+          workdir, report = sys.argv[1], sys.argv[2]
+          wb = openpyxl.Workbook(); wb.remove(wb.active)
+          for path in sorted(glob.glob(os.path.join(workdir, "*.csv"))):
+              # Sheet names: max 31 chars, no []:*?/\ — strip the numeric prefix.
+              name = os.path.splitext(os.path.basename(path))[0]
+              name = name.split("_", 1)[-1] if name[:2].isdigit() else name
+              for ch in r'[]:*?/\\':
+                  name = name.replace(ch, " ")
+              ws = wb.create_sheet(name[:31] or "Sheet")
+              with open(path, newline='') as f:
+                  for row in csv.reader(f):
+                      ws.append(row)
+          wb.save(report)
+          print("Wrote", report, "with", len(wb.sheetnames), "sheet(s)")
+          PY
           echo "##vso[task.setvariable variable=reportPath]$REPORT"
         displayName: 15. Build .xlsx report
         condition: always()
@@ -497,46 +515,62 @@ jobs:
         env:
           REPORTPATH: $(reportPath)
 
-      # ── STEP 18 — Google Chat: anomalies + FAILED + SKIPPED by name ───────
+      # ── STEP 18 — Google Chat: threaded Card V2 "Preflight" run status ────
+      #   Shows only the actual Preflight checks (Auth probe rows excluded),
+      #   grouped into Checked / Needs attention / Skipped, plus a button that
+      #   opens the report's blob container in the Azure portal. Posted into a
+      #   stable thread so weekly runs land under one "Preflight" thread.
       - bash: |
           set -uo pipefail
           [ -z "${GCHAT_WEBHOOK_URL:-}" ] && { echo "No webhook — skipping."; exit 0; }
           GROUPS=$(python3 - "$(workDir)/00_Summary.csv" <<'PY'
           import csv, sys, json
-          g = {"anomaly": [], "failed": [], "skipped": [], "ok": 0}
+          g = {"passed": [], "attention": [], "skipped": []}
           with open(sys.argv[1], newline='') as f:
               r = csv.reader(f); next(r, None)
               for row in r:
                   if len(row) < 3: continue
                   check, res, st = row[0], row[1], row[2]
+                  if check.startswith("Auth:"):   # infra probe, not a preflight check
+                      continue
                   label = f"{check} — {res}" if res else check
-                  if st in ("WARNING", "ALERT"): g["anomaly"].append(label)
-                  elif st == "FAILED":           g["failed"].append(label)
-                  elif st in ("SKIP", "EMPTY"):  g["skipped"].append(label)
-                  else: g["ok"] += 1
-          for k in ("anomaly", "failed", "skipped"): g[k] = g[k][:30]
+                  if st in ("WARNING", "ALERT", "FAILED"): g["attention"].append(label)
+                  elif st in ("SKIP", "EMPTY"):            g["skipped"].append(label)
+                  else:                                     g["passed"].append(label)
+          for k in g: g[k] = g[k][:30]
           print(json.dumps(g))
           PY
           )
+          # Azure portal link to the report's blob container (opens in the tenant/directory).
+          BLOB_URL="https://portal.azure.com/#@/resource/subscriptions/$(subscriptionId)/resourceGroups/$(resourceGroup)/providers/Microsoft.Storage/storageAccounts/$(storageAccount)/containersList"
           PAYLOAD=$(jq -n --argjson g "$GROUPS" \
             --arg ts "$(date -u '+%Y-%m-%d %H:%M UTC')" \
-            --arg url "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)" '
+            --arg url "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)" \
+            --arg blob "$BLOB_URL" \
+            --arg tkey "asgardeo-preflight" '
             def sec(t; icon; items):
               if (items|length) > 0
               then {header:(t+" ("+(items|length|tostring)+")"),
                     widgets:(items|map({decoratedText:{startIcon:{materialIcon:{name:icon}},text:.}}))}
               else empty end;
-            {cardsV2:[{cardId:"asgardeo-preflight",card:{
-              header:{title:"Asgardeo Preflight Check",
-                      subtitle:($ts+"  |  OK:"+($g.ok|tostring)+"  Warn:"+($g.anomaly|length|tostring)+"  Fail:"+($g.failed|length|tostring)+"  Skip:"+($g.skipped|length|tostring))},
+            {thread:{threadKey:$tkey},
+             cardsV2:[{cardId:"asgardeo-preflight",card:{
+              header:{title:"Preflight",
+                      subtitle:($ts+"  |  Checked:"+($g.passed|length|tostring)+"  Attention:"+($g.attention|length|tostring)+"  Skipped:"+($g.skipped|length|tostring))},
               sections:([
-                sec("Anomalies";"warning";$g.anomaly),
-                sec("Failed";"error";$g.failed),
-                sec("Skipped / No data";"do_not_disturb_on";$g.skipped),
-                {widgets:[{buttonList:{buttons:[{text:"Open pipeline run",onClick:{openLink:{url:$url}}}]}}]}
+                sec("Needs attention";"warning";$g.attention),
+                sec("Checked";"check_circle";$g.passed),
+                sec("Skipped / Not applicable";"do_not_disturb_on";$g.skipped),
+                {widgets:[{buttonList:{buttons:[
+                  {text:"Open pipeline run",onClick:{openLink:{url:$url}}},
+                  {text:"Open blob container",onClick:{openLink:{url:$blob}}}
+                ]}}]}
               ])}}]}')
-          curl -sS -H "Content-Type: application/json" -d "$PAYLOAD" "$GCHAT_WEBHOOK_URL" >/dev/null \
-            && echo "Posted card to Google Chat."
+          # Thread the message (create the thread on first run, reply on later runs).
+          case "$GCHAT_WEBHOOK_URL" in *\?*) SEP="&";; *) SEP="?";; esac
+          POST_URL="${GCHAT_WEBHOOK_URL}${SEP}messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"
+          curl -sS -H "Content-Type: application/json" -d "$PAYLOAD" "$POST_URL" >/dev/null \
+            && echo "Posted threaded 'Preflight' card to Google Chat."
         displayName: 18. Notify Google Chat
         condition: always()
         env:
