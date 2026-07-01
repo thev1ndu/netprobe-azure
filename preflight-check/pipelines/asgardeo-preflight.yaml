@@ -42,6 +42,7 @@ variables:
   subscriptionId:       '38785beb-5019-4896-8679-3d41ddacc4b1'
   resourceGroup:        'rg-thevindu'
   workspaceId:          'e5d406b5-f761-48a7-9466-9d0d4a768f01'
+  keyVaultNames:        'kv-preflight-thevindu'  # comma-separated; empty = skip cert check
   sqlServer:            ''                      # empty = skip SQL check
   aksServiceConnection: 'rnd-aks-thevindu'
   storageAccount:       'sa18436'
@@ -527,29 +528,43 @@ jobs:
           ScriptType: InlineScript
           Inline: |
             . '$(libps)'
-            $warnDays = ${{ parameters.certExpiryWarningDays }}
-            $csvPath  = Join-Path $WorkDir '09_Certificates.csv'
-            $lines    = @('"Vault","Certificate","DaysRemaining","Status"')
-            $now      = [datetime]::UtcNow
-            $expiring = $false
-            foreach ($v in Get-AzKeyVault) {
-              try { $certs = Get-AzKeyVaultCertificate -VaultName $v.VaultName -ErrorAction Stop } catch { continue }
-              foreach ($c in $certs) {
-                if (-not $c.Expires) { continue }   # mirrors the bash `exp == null` skip
-                $days = [int][math]::Truncate(($c.Expires.ToUniversalTime() - $now).TotalDays)
-                $status = 'OK'
-                if ($days -lt 0) { $status = 'EXPIRED' }
-                elseif ($days -lt $warnDays) { $status = 'EXPIRING' }
-                $lines += (Format-CsvField $v.VaultName) + ',' + (Format-CsvField $c.Name) + ',' + $days + ',' + (Format-CsvField $status)
-                if ($status -ne 'OK') {
-                  Add-Note ('Cert ' + $v.VaultName + '/' + $c.Name + ': ' + $status + ' (' + $days + 'd)')
-                  $expiring = $true
+            $warnDays   = ${{ parameters.certExpiryWarningDays }}
+            $csvPath    = Join-Path $WorkDir '09_Certificates.csv'
+            $lines      = @('"Vault","Certificate","DaysRemaining","Status"')
+            $now        = [datetime]::UtcNow
+            $expiring   = $false
+            $vaultNames = '$(keyVaultNames)' -split ',' |
+                            ForEach-Object { $_.Trim() } | Where-Object { $_ }
+            if (-not $vaultNames) {
+              $lines += '"(not configured)","","","SKIP"'
+              $lines | Set-Content -LiteralPath $csvPath
+              Add-Summary 'Certificates' 'no vaults configured' 'SKIP'
+            } else {
+              foreach ($vName in $vaultNames) {
+                try {
+                  $certs = Get-AzKeyVaultCertificate -VaultName $vName -ErrorAction Stop
+                } catch {
+                  $e = ($_.Exception.Message -replace '\s+', ' ').Trim()
+                  if ($e.Length -gt 150) { $e = $e.Substring(0, 150) }
+                  $lines += (Format-CsvField $vName) + ',"","","FAILED: ' + ($e -replace '"', '') + '"'
+                  Add-Note ('Certificate check: cannot list ' + $vName + ' — ' + $e)
+                  continue
+                }
+                foreach ($c in $certs) {
+                  if (-not $c.Expires) { continue }
+                  $days   = [int][math]::Truncate(($c.Expires.ToUniversalTime() - $now).TotalDays)
+                  $status = if ($days -lt 0) { 'EXPIRED' } elseif ($days -lt $warnDays) { 'EXPIRING' } else { 'OK' }
+                  $lines += (Format-CsvField $vName) + ',' + (Format-CsvField $c.Name) + ',' + $days + ',' + (Format-CsvField $status)
+                  if ($status -ne 'OK') {
+                    Add-Note ('Cert ' + $vName + '/' + $c.Name + ': ' + $status + ' (' + $days + 'd)')
+                    $expiring = $true
+                  }
                 }
               }
+              $lines | Set-Content -LiteralPath $csvPath
+              $overall = if ($expiring) { 'WARNING' } else { 'OK' }
+              Add-Summary 'Certificates' 'expiry scan' $overall
             }
-            $lines | Set-Content -LiteralPath $csvPath
-            $status = if ($expiring) { 'WARNING' } else { 'OK' }
-            Add-Summary 'Certificates' 'expiry scan' $status
 
       # ── STEP 12 — Weekly cost ─────────────────────────────────────────────
       #   Uses the Az PowerShell Cost Management cmdlet (Invoke-AzCostManagementQuery)
