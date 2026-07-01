@@ -498,11 +498,10 @@ jobs:
                   if (-not $c.Expires) { continue }
                   $days   = [int][math]::Truncate(($c.Expires.ToUniversalTime() - $now).TotalDays)
                   $status = if ($days -lt 0) { 'EXPIRED' } elseif ($days -lt $warnDays) { 'EXPIRING' } else { 'OK' }
+                  if ($status -eq 'OK') { continue }
                   $lines += (Format-CsvField $vName) + ',' + (Format-CsvField $c.Name) + ',' + $days + ',' + (Format-CsvField $status)
-                  if ($status -ne 'OK') {
-                    Add-Note ('Cert ' + $vName + '/' + $c.Name + ': ' + $status + ' (' + $days + 'd)')
-                    $expiring = $true
-                  }
+                  Add-Note ('Cert ' + $vName + '/' + $c.Name + ': ' + $status + ' (' + $days + 'd)')
+                  $expiring = $true
                 }
               }
               $lines | Set-Content -LiteralPath $csvPath
@@ -527,13 +526,6 @@ jobs:
             $costCsv       = Join-Path $WorkDir '10_Weekly_Cost.csv'
             $costThreshold = ${{ parameters.costIncreasePercentThreshold }}
 
-            '"Scope","Period","Cost","Note"' | Set-Content -LiteralPath $costCsv
-            function Add-CostRow($scope, $period, $cost, $note) {
-              $c = 0.0; [double]::TryParse([string]$cost, [ref]$c) | Out-Null
-              ('{0},{1},{2},{3}' -f (Format-CsvField $scope), (Format-CsvField $period), $c, (Format-CsvField $note)) |
-                Add-Content -LiteralPath $costCsv
-            }
-
             function Get-Cost($scope, [datetime]$from, [datetime]$to) {
               try {
                 $q = Invoke-AzCostManagementQuery -Scope $scope -Type ActualCost -Timeframe Custom `
@@ -555,24 +547,23 @@ jobs:
             $today   = [datetime]::UtcNow.Date
             $cwEnd   = $today.AddDays(-1);  $cwStart = $today.AddDays(-8)
             $pwEnd   = $today.AddDays(-9);  $pwStart = $today.AddDays(-15)
-            $cwLabel = 'This week ('  + $cwStart.ToString('yyyy-MM-dd') + '..' + $cwEnd.ToString('yyyy-MM-dd') + ')'
-            $pwLabel = 'Prior week (' + $pwStart.ToString('yyyy-MM-dd') + '..' + $pwEnd.ToString('yyyy-MM-dd') + ')'
+            $cwLabel = 'Current Week (' + $cwStart.ToString('yyyy-MM-dd') + '..' + $cwEnd.ToString('yyyy-MM-dd') + ')'
+            $pwLabel = 'Prior Week ('   + $pwStart.ToString('yyyy-MM-dd') + '..' + $pwEnd.ToString('yyyy-MM-dd') + ')'
 
-            $subScope = 'subscriptions/' + $sub
-            $rgScope  = 'subscriptions/' + $sub + '/resourceGroups/' + $rg
+            $rgScope = 'subscriptions/' + $sub + '/resourceGroups/' + $rg
 
-            $subCw = Get-Cost $subScope $cwStart $cwEnd
-            $subPw = Get-Cost $subScope $pwStart $pwEnd
-            Add-CostRow 'Subscription' $cwLabel (Or-Zero $subCw.Out) $subCw.Err
-            Add-CostRow 'Subscription' $pwLabel (Or-Zero $subPw.Out) $subPw.Err
+            ('"Resource Group",' + (Format-CsvField $cwLabel) + ',' + (Format-CsvField $pwLabel)) |
+              Set-Content -LiteralPath $costCsv
 
             $rgCw = Get-Cost $rgScope $cwStart $cwEnd
             $rgPw = Get-Cost $rgScope $pwStart $pwEnd
-            Add-CostRow ('RG ' + $rg) $cwLabel (Or-Zero $rgCw.Out) $rgCw.Err
-            Add-CostRow ('RG ' + $rg) $pwLabel (Or-Zero $rgPw.Out) $rgPw.Err
 
-            if ($null -ne $subCw.Out -or $null -ne $subPw.Out) {
-              $c = [double](Or-Zero $subCw.Out); $p = [double](Or-Zero $subPw.Out)
+            $cwVal = '{0:F2}' -f [double](Or-Zero $rgCw.Out)
+            $pwVal = '{0:F2}' -f [double](Or-Zero $rgPw.Out)
+            ((Format-CsvField $rg) + ',' + $cwVal + ',' + $pwVal) | Add-Content -LiteralPath $costCsv
+
+            if ($null -ne $rgCw.Out -or $null -ne $rgPw.Out) {
+              $c = [double](Or-Zero $rgCw.Out); $p = [double](Or-Zero $rgPw.Out)
               $status = 'OK'
               $result = 'this $' + ('{0:F2}' -f $c) + ' vs prior $' + ('{0:F2}' -f $p)
               if ($p -gt 0 -and ((($c - $p) / $p) * 100) -gt $costThreshold) {
@@ -582,15 +573,9 @@ jobs:
                 Add-Note ('Cost up ' + $pct + '% week-over-week')
               }
               Add-Summary 'Weekly Cost' $result $status
-            }
-            elseif ($null -ne $rgCw.Out -or $null -ne $rgPw.Out) {
-              $rgS = '{0:F2}' -f (Or-Zero $rgCw.Out)
-              Add-Summary 'Weekly Cost' ('sub scope empty (' + $subCw.Err + '); RG ' + $rg + ' = $' + $rgS) 'WARNING'
-              Add-Note ('Weekly Cost: subscription scope empty (' + $subCw.Err + ') but RG ' + $rg + ' has data — this is a subscription-level scope/permission gap, not missing data.')
-            }
-            else {
-              Add-Summary 'Weekly Cost' ('returned nothing — sub: ' + $subCw.Err + ' | rg: ' + $rgCw.Err) 'FAILED'
-              Add-Note ('Weekly Cost FAILED — sub scope: ' + $subCw.Err + '; rg scope: ' + $rgCw.Err + ". If both say 403/permission, grant the SP 'Cost Management Reader'.")
+            } else {
+              Add-Summary 'Weekly Cost' ('returned nothing — ' + $rgCw.Err) 'FAILED'
+              Add-Note ('Weekly Cost FAILED — rg scope: ' + $rgCw.Err + ". If 403/permission, grant the SP 'Cost Management Reader'.")
             }
 
       - task: AzurePowerShell@5
