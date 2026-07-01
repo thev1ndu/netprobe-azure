@@ -93,6 +93,10 @@ jobs:
           export SUMMARY="$(workDir)/00_Summary.csv"
           export WORKSPACE_ID="$(workspaceId)"
           export LOOKBACK=${{ parameters.lookbackDays }}
+          # Silence az core warnings (e.g. the cdn/afd deprecation banner) so they
+          # can't leak onto stderr and mask the real error in QUERY_ERR. Errors are
+          # still shown.
+          export AZURE_CORE_ONLY_SHOW_ERRORS=true
           EOF
           cat >> "$(lib)" <<'EOF'
           # NOTE: kql returns its output in the global QUERY_OUT (NOT via stdout).
@@ -104,7 +108,9 @@ jobs:
             if QUERY_OUT=$(az monitor log-analytics query -w "$WORKSPACE_ID" --timespan "P${LOOKBACK}D" --analytics-query "$1" -o json 2>"$err"); then
               :
             else
-              QUERY_OK=0; QUERY_ERR=$(tr '\n' ' ' <"$err" | tr '"' "'" | head -c 200); QUERY_OUT='[]'
+              # Drop WARNING/deprecation lines first so the genuine error (not an
+              # az banner) is what survives the 200-char truncation.
+              QUERY_OK=0; QUERY_ERR=$(grep -vi '^WARNING' "$err" | tr '\n' ' ' | tr '"' "'" | head -c 200); QUERY_OUT='[]'
             fi
             rm -f "$err"
           }
@@ -523,7 +529,10 @@ jobs:
       - bash: |
           set -uo pipefail
           [ -z "${GCHAT_WEBHOOK_URL:-}" ] && { echo "No webhook — skipping."; exit 0; }
-          GROUPS=$(python3 - "$(workDir)/00_Summary.csv" <<'PY'
+          # NOTE: do NOT name this GROUPS — that is a special bash array (the
+          # current user's group IDs) and the assignment gets silently clobbered,
+          # so $GROUPS would expand to a numeric GID and break the jq below.
+          CARD_GROUPS=$(python3 - "$(workDir)/00_Summary.csv" <<'PY'
           import csv, sys, json
           g = {"passed": [], "attention": [], "skipped": []}
           with open(sys.argv[1], newline='') as f:
@@ -543,7 +552,7 @@ jobs:
           )
           # Azure portal link to the report's blob container (opens in the tenant/directory).
           BLOB_URL="https://portal.azure.com/#@/resource/subscriptions/$(subscriptionId)/resourceGroups/$(resourceGroup)/providers/Microsoft.Storage/storageAccounts/$(storageAccount)/containersList"
-          PAYLOAD=$(jq -n --argjson g "$GROUPS" \
+          PAYLOAD=$(jq -n --argjson g "$CARD_GROUPS" \
             --arg ts "$(date -u '+%Y-%m-%d %H:%M UTC')" \
             --arg url "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)" \
             --arg blob "$BLOB_URL" \
@@ -566,11 +575,18 @@ jobs:
                   {text:"Open blob container",onClick:{openLink:{url:$blob}}}
                 ]}}]}
               ])}}]}')
+          # Bail loudly if the card never built — otherwise we'd POST an empty
+          # body and still print "Posted", masking the real failure.
+          [ -z "$PAYLOAD" ] && { echo "##[error]Card payload is empty (jq failed) — not posting."; exit 1; }
           # Thread the message (create the thread on first run, reply on later runs).
           case "$GCHAT_WEBHOOK_URL" in *\?*) SEP="&";; *) SEP="?";; esac
           POST_URL="${GCHAT_WEBHOOK_URL}${SEP}messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"
-          curl -sS -H "Content-Type: application/json" -d "$PAYLOAD" "$POST_URL" >/dev/null \
-            && echo "Posted threaded 'Preflight' card to Google Chat."
+          CODE=$(curl -sS -o /tmp/gchat_resp -w '%{http_code}' -H "Content-Type: application/json" -d "$PAYLOAD" "$POST_URL")
+          if [ "$CODE" = "200" ]; then
+            echo "Posted threaded 'Preflight' card to Google Chat."
+          else
+            echo "##[error]Google Chat POST failed (HTTP $CODE): $(cat /tmp/gchat_resp)"; exit 1
+          fi
         displayName: 18. Notify Google Chat
         condition: always()
         env:
