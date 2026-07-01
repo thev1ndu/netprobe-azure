@@ -271,7 +271,7 @@ jobs:
             . '$(libps)'
             # Seeded via seed-sample-logs.sh — mirrors AzureDiagnostics (Category -> Category_s).
             $q = Invoke-Kql 'PreflightAzureDiagnostics_CL
-              | where Category_s =~ "FrontdoorAccessLog"
+              | where Category =~ "FrontdoorAccessLog"
               | summarize Requests = count() by bin(TimeGenerated, 1d)
               | project Day = TimeGenerated, Requests | order by Day asc'
             $rows = $q.Rows
@@ -304,7 +304,7 @@ jobs:
             . '$(libps)'
             # Seeded via seed-sample-logs.sh — mirrors AzureDiagnostics (Category -> Category_s).
             $q = Invoke-Kql 'PreflightAzureDiagnostics_CL
-              | where Category_s =~ "FrontdoorAccessLog"
+              | where Category =~ "FrontdoorAccessLog"
               | extend reqUri = tostring(requestUri_s)
               | extend tenant_from_path = extract(@"/t/([^/]+)", 1, reqUri)
               | extend custom_domain = extract(@"https?://([^/:]+)", 1, reqUri)
@@ -794,15 +794,13 @@ jobs:
           PAYLOAD=$(jq -n --argjson g "$CARD_GROUPS" \
             --arg ts "$(date -u '+%Y-%m-%d %H:%M UTC')" \
             --arg url "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)" \
-            --arg blob "$BLOB_URL" \
-            --arg tkey "asgardeo-preflight" '
+            --arg blob "$BLOB_URL" '
             def sec(t; icon; items):
               if (items|length) > 0
               then {header:(t+" ("+(items|length|tostring)+")"),
                     widgets:(items|map({decoratedText:{startIcon:{materialIcon:{name:icon}},text:.}}))}
               else empty end;
-            {thread:{threadKey:$tkey},
-             cardsV2:[{cardId:"asgardeo-preflight",card:{
+            {cardsV2:[{cardId:"asgardeo-preflight",card:{
               header:{title:"Preflight",
                       subtitle:($ts+"  |  Checked:"+($g.passed|length|tostring)+"  Attention:"+($g.attention|length|tostring)+"  Skipped:"+($g.skipped|length|tostring))},
               sections:([
@@ -817,12 +815,9 @@ jobs:
           # Bail loudly if the card never built — otherwise we'd POST an empty
           # body and still print "Posted", masking the real failure.
           [ -z "$PAYLOAD" ] && { echo "##[error]Card payload is empty (jq failed) — not posting."; exit 1; }
-          # Thread the message (create the thread on first run, reply on later runs).
-          case "$GCHAT_WEBHOOK_URL" in *\?*) SEP="&";; *) SEP="?";; esac
-          POST_URL="${GCHAT_WEBHOOK_URL}${SEP}messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"
-          CODE=$(curl -sS -o /tmp/gchat_resp -w '%{http_code}' -H "Content-Type: application/json" -d "$PAYLOAD" "$POST_URL")
+          CODE=$(curl -sS -o /tmp/gchat_resp -w '%{http_code}' -H "Content-Type: application/json" -d "$PAYLOAD" "$GCHAT_WEBHOOK_URL")
           if [ "$CODE" = "200" ]; then
-            echo "Posted threaded 'Preflight' card to Google Chat."
+            echo "Posted 'Preflight' card to Google Chat."
           else
             echo "##[error]Google Chat POST failed (HTTP $CODE): $(cat /tmp/gchat_resp)"; exit 1
           fi
