@@ -37,6 +37,7 @@ variables:
   reportDir:            $(Build.ArtifactStagingDirectory)/report     # holds only the published .xlsx
   warnings:             $(Build.ArtifactStagingDirectory)/warnings.txt
   lib:                  $(Build.ArtifactStagingDirectory)/lib.sh     # shared bash helpers
+  libps:                $(Build.ArtifactStagingDirectory)/lib.ps1    # shared Az PowerShell helpers
   subscriptionId:       '38785beb-5019-4896-8679-3d41ddacc4b1'
   resourceGroup:        'rg-thevindu'
   workspaceId:          'e5d406b5-f761-48a7-9466-9d0d4a768f01'
@@ -117,98 +118,157 @@ jobs:
           summary() { jq -rn --arg c "$1" --arg r "$2" --arg s "$3" '[$c,$r,$s]|@csv' >> "$SUMMARY"; }
           note()    { echo "$1" >> "$WARNINGS"; }
           EOF
+          # lib.ps1 — the AzurePowerShell@5 mirror of lib.sh. DevOps macros ($(workDir)
+          # etc.) are expanded before bash runs, so the quoted heredoc is safe.
+          cat > "$(libps)" <<'PSEOF'
+          # Shared Az PowerShell helpers. Dot-source at the top of a step:  . '$(libps)'
+          $script:WorkDir     = '$(workDir)'
+          $script:Warnings    = '$(warnings)'
+          $script:SummaryCsv  = Join-Path '$(workDir)' '00_Summary.csv'
+          $script:WorkspaceId = '$(workspaceId)'
+          $script:Lookback    = ${{ parameters.lookbackDays }}
+
+          # Invoke-Kql <query> -> @{ Ok=<bool>; Err='<why>'; Rows=@(<row objects>) }.
+          # Mirrors lib.sh kql(): never throws. Ok=$false carries the real error
+          # (permission/syntax) trimmed to 200 chars; Ok=$true + empty Rows = 0 rows.
+          function Invoke-Kql([string]$Query) {
+            try {
+              $r = Invoke-AzOperationalInsightsQuery -WorkspaceId $script:WorkspaceId `
+                     -Query $Query -Timespan (New-TimeSpan -Days $script:Lookback) -ErrorAction Stop
+              return @{ Ok = $true; Err = ''; Rows = @($r.Results) }
+            } catch {
+              $m = ($_.Exception.Message -replace '\s+', ' ').Trim()
+              if ($m.Length -gt 200) { $m = $m.Substring(0, 200) }
+              return @{ Ok = $false; Err = $m; Rows = @() }
+            }
+          }
+
+          # CSV escaping matching jq @csv: quote strings, double embedded quotes.
+          function Format-CsvField($v) { '"' + ([string]$v -replace '"', '""') + '"' }
+          function Or-Zero($v) { if ($null -ne $v) { $v } else { 0 } }
+
+          # summary()/note() equivalents — append to the same files the bash lib writes.
+          function Add-Summary($Check, $Result, $Status) {
+            ('{0},{1},{2}' -f (Format-CsvField $Check), (Format-CsvField $Result), (Format-CsvField $Status)) |
+              Add-Content -LiteralPath $script:SummaryCsv
+          }
+          function Add-Note($Message) { $Message | Add-Content -LiteralPath $script:Warnings }
+          PSEOF
         displayName: 1. Init outputs + helpers
 
       # ── STEP 2 — AUTH PROBE: permission problem vs genuine no-data ────────
-      - task: AzureCLI@2
+      - task: AzurePowerShell@5
         displayName: 2. Verify access (auth probe)
         continueOnError: true
         inputs:
           azureSubscription: $(AZURE_SERVICE_CONNECTION)
-          scriptType: bash
-          scriptLocation: inlineScript
-          inlineScript: |
-            set -uo pipefail
-            source "$(lib)"
-            echo "Service principal context:"; az account show --query "{name:name,id:id}" -o jsonc || true
-            if az account set -s $(subscriptionId) 2>/tmp/se; then
-              summary "Auth: subscription" "active = $(subscriptionId)" OK
-            else
-              summary "Auth: subscription" "$(tr '\n' ' ' </tmp/se | head -c 150)" FAILED
-              note "Cannot set subscription $(subscriptionId) — SP has no access."
-            fi
-            kql 'print probe=1'
-            if [ "$QUERY_OK" = 1 ]; then
-              summary "Auth: Log Analytics" "query API reachable" OK
-            else
-              summary "Auth: Log Analytics" "$QUERY_ERR" FAILED
-              note "Log Analytics query API FAILED (likely missing 'Log Analytics Reader' on workspace): $QUERY_ERR"
-            fi
+          azurePowerShellVersion: LatestVersion
+          pwsh: true
+          ScriptType: InlineScript
+          Inline: |
+            . '$(libps)'
+            $ctx = Get-AzContext
+            Write-Host ('Service principal context: ' + $ctx.Account.Id + ' / ' + $ctx.Subscription.Name)
+            try {
+              Set-AzContext -Subscription '$(subscriptionId)' -ErrorAction Stop | Out-Null
+              Add-Summary 'Auth: subscription' 'active = $(subscriptionId)' 'OK'
+            } catch {
+              $e = ($_.Exception.Message -replace '\s+', ' ').Trim()
+              if ($e.Length -gt 150) { $e = $e.Substring(0, 150) }
+              Add-Summary 'Auth: subscription' $e 'FAILED'
+              Add-Note 'Cannot set subscription $(subscriptionId) — SP has no access.'
+            }
+            $probe = Invoke-Kql 'print probe=1'
+            if ($probe.Ok) {
+              Add-Summary 'Auth: Log Analytics' 'query API reachable' 'OK'
+            } else {
+              Add-Summary 'Auth: Log Analytics' $probe.Err 'FAILED'
+              Add-Note ("Log Analytics query API FAILED (likely missing 'Log Analytics Reader' on workspace): " + $probe.Err)
+            }
 
       # ── STEP 3 — Log ingestion volume ─────────────────────────────────────
-      - task: AzureCLI@2
+      - task: AzurePowerShell@5
         displayName: 3. Log ingestion volume
         continueOnError: true
         inputs:
           azureSubscription: $(AZURE_SERVICE_CONNECTION)
-          scriptType: bash
-          scriptLocation: inlineScript
-          inlineScript: |
-            set -uo pipefail
-            source "$(lib)"; az account set -s $(subscriptionId) 2>/dev/null || true
+          azurePowerShellVersion: LatestVersion
+          pwsh: true
+          ScriptType: InlineScript
+          Inline: |
+            . '$(libps)'
             # Seeded via seed-sample-logs.sh — mirrors built-in Usage (Quantity -> Quantity_d).
-            kql 'PreflightUsage_CL
+            $q = Invoke-Kql 'PreflightUsage_CL
               | summarize TotalVolumeGB = sum(Quantity_d / 1000.) by bin(TimeGenerated, 1d)
               | project Day = TimeGenerated, TotalVolumeGB | order by Day asc'
-            DATA="$QUERY_OUT"
-            echo "$DATA" | jq -r '["Day","VolumeGB"],(.[]|[((.Day // .TimeGenerated)|tostring)[:10],(.TotalVolumeGB|tonumber)])|@csv' > "$WORKDIR/01_Log_Ingestion.csv"
-            if [ "$QUERY_OK" = 0 ]; then summary "Log Ingestion" "$QUERY_ERR" FAILED; note "Log Ingestion FAILED: $QUERY_ERR"
-            elif [ "$(echo "$DATA" | jq 'length')" = 0 ]; then summary "Log Ingestion" "query ran, 0 rows" EMPTY; note "Log Ingestion: 0 rows (no data in window or table empty)."
-            else
-              PEAK=$(echo "$DATA" | jq -r '[.[].TotalVolumeGB|tonumber]|max // 0')
-              AVG=$(echo "$DATA"  | jq -r '([.[].TotalVolumeGB|tonumber]|add)/length')
-              STATUS=OK; awk -v p="$PEAK" -v a="$AVG" 'BEGIN{exit (a>0 && p>2*a)?0:1}' && { STATUS=WARNING; note "Log ingestion: peak day >2x average"; }
-              summary "Log Ingestion" "$(printf 'peak %.2f / avg %.2f GB/day' "$PEAK" "$AVG")" "$STATUS"
-            fi
+            $rows = $q.Rows
+            $lines = @('"Day","VolumeGB"')
+            foreach ($r in $rows) {
+              $dayVal = if ($r.Day) { $r.Day } else { $r.TimeGenerated }
+              $day = [string]$dayVal; if ($day.Length -ge 10) { $day = $day.Substring(0, 10) }
+              $lines += (Format-CsvField $day) + ',' + [double]$r.TotalVolumeGB
+            }
+            $lines | Set-Content -LiteralPath (Join-Path $WorkDir '01_Log_Ingestion.csv')
+            if (-not $q.Ok) {
+              Add-Summary 'Log Ingestion' $q.Err 'FAILED'; Add-Note ('Log Ingestion FAILED: ' + $q.Err)
+            } elseif ($rows.Count -eq 0) {
+              Add-Summary 'Log Ingestion' 'query ran, 0 rows' 'EMPTY'
+              Add-Note 'Log Ingestion: 0 rows (no data in window or table empty).'
+            } else {
+              $vals = $rows | ForEach-Object { [double]$_.TotalVolumeGB }
+              $peak = ($vals | Measure-Object -Maximum).Maximum
+              $avg  = ($vals | Measure-Object -Average).Average
+              $status = 'OK'
+              if ($avg -gt 0 -and $peak -gt 2 * $avg) { $status = 'WARNING'; Add-Note 'Log ingestion: peak day >2x average' }
+              Add-Summary 'Log Ingestion' ('peak {0:F2} / avg {1:F2} GB/day' -f $peak, $avg) $status
+            }
 
       # ── STEP 4 — Frontdoor traffic ────────────────────────────────────────
-      - task: AzureCLI@2
+      - task: AzurePowerShell@5
         displayName: 4. Frontdoor traffic
         continueOnError: true
         inputs:
           azureSubscription: $(AZURE_SERVICE_CONNECTION)
-          scriptType: bash
-          scriptLocation: inlineScript
-          inlineScript: |
-            set -uo pipefail
-            source "$(lib)"; az account set -s $(subscriptionId) 2>/dev/null || true
+          azurePowerShellVersion: LatestVersion
+          pwsh: true
+          ScriptType: InlineScript
+          Inline: |
+            . '$(libps)'
             # Seeded via seed-sample-logs.sh — mirrors AzureDiagnostics (Category -> Category_s).
-            kql 'PreflightAzureDiagnostics_CL
+            $q = Invoke-Kql 'PreflightAzureDiagnostics_CL
               | where Category_s =~ "FrontdoorAccessLog"
               | summarize Requests = count() by bin(TimeGenerated, 1d)
               | project Day = TimeGenerated, Requests | order by Day asc'
-            DATA="$QUERY_OUT"
-            echo "$DATA" | jq -r '["Day","Requests"],(.[]|[((.Day // .TimeGenerated)|tostring)[:10],(.Requests)])|@csv' > "$WORKDIR/02_Frontdoor_Traffic.csv"
-            if [ "$QUERY_OK" = 0 ]; then summary "Frontdoor Traffic" "$QUERY_ERR" FAILED; note "Frontdoor Traffic FAILED: $QUERY_ERR"
-            elif [ "$(echo "$DATA" | jq 'length')" = 0 ]; then summary "Frontdoor Traffic" "query ran, 0 rows" EMPTY
-            else
-              PEAK=$(echo "$DATA" | jq -r '[.[].Requests|tonumber]|max // 0')
-              summary "Frontdoor Traffic" "peak ${PEAK} requests/day" OK
-            fi
+            $rows = $q.Rows
+            $lines = @('"Day","Requests"')
+            foreach ($r in $rows) {
+              $dayVal = if ($r.Day) { $r.Day } else { $r.TimeGenerated }
+              $day = [string]$dayVal; if ($day.Length -ge 10) { $day = $day.Substring(0, 10) }
+              $lines += (Format-CsvField $day) + ',' + [long]$r.Requests
+            }
+            $lines | Set-Content -LiteralPath (Join-Path $WorkDir '02_Frontdoor_Traffic.csv')
+            if (-not $q.Ok) {
+              Add-Summary 'Frontdoor Traffic' $q.Err 'FAILED'; Add-Note ('Frontdoor Traffic FAILED: ' + $q.Err)
+            } elseif ($rows.Count -eq 0) {
+              Add-Summary 'Frontdoor Traffic' 'query ran, 0 rows' 'EMPTY'
+            } else {
+              $peak = ($rows | ForEach-Object { [long]$_.Requests } | Measure-Object -Maximum).Maximum
+              Add-Summary 'Frontdoor Traffic' ('peak ' + $peak + ' requests/day') 'OK'
+            }
 
       # ── STEP 5 — Top traffic tenants ──────────────────────────────────────
-      - task: AzureCLI@2
+      - task: AzurePowerShell@5
         displayName: 5. Top traffic tenants
         continueOnError: true
         inputs:
           azureSubscription: $(AZURE_SERVICE_CONNECTION)
-          scriptType: bash
-          scriptLocation: inlineScript
-          inlineScript: |
-            set -uo pipefail
-            source "$(lib)"; az account set -s $(subscriptionId) 2>/dev/null || true
+          azurePowerShellVersion: LatestVersion
+          pwsh: true
+          ScriptType: InlineScript
+          Inline: |
+            . '$(libps)'
             # Seeded via seed-sample-logs.sh — mirrors AzureDiagnostics (Category -> Category_s).
-            kql 'PreflightAzureDiagnostics_CL
+            $q = Invoke-Kql 'PreflightAzureDiagnostics_CL
               | where Category_s =~ "FrontdoorAccessLog"
               | extend reqUri = tostring(requestUri_s)
               | extend tenant_from_path = extract(@"/t/([^/]+)", 1, reqUri)
@@ -217,58 +277,71 @@ jobs:
                   isnotempty(custom_domain) and custom_domain !contains "asgardeo.io", custom_domain, "")
               | where isnotempty(tenant)
               | summarize request_count = count() by tenant | top 5 by request_count desc'
-            DATA="$QUERY_OUT"
-            echo "$DATA" | jq -r '["Tenant","RequestCount"],(.[]|[.tenant,.request_count])|@csv' > "$WORKDIR/03_Top_Traffic_Tenants.csv"
-            if [ "$QUERY_OK" = 0 ]; then summary "Top Traffic Tenants" "$QUERY_ERR" FAILED; note "Top Traffic Tenants FAILED: $QUERY_ERR"
-            else
-              TOP=$(echo "$DATA" | jq -r '[.[]|"\(.tenant)=\(.request_count)"]|.[0:3]|join(", ")')
-              summary "Top Traffic Tenants" "${TOP:-none}" "$([ -z "$TOP" ] && echo EMPTY || echo OK)"
-            fi
+            $rows = $q.Rows
+            $lines = @('"Tenant","RequestCount"')
+            foreach ($r in $rows) { $lines += (Format-CsvField $r.tenant) + ',' + [long]$r.request_count }
+            $lines | Set-Content -LiteralPath (Join-Path $WorkDir '03_Top_Traffic_Tenants.csv')
+            if (-not $q.Ok) {
+              Add-Summary 'Top Traffic Tenants' $q.Err 'FAILED'; Add-Note ('Top Traffic Tenants FAILED: ' + $q.Err)
+            } else {
+              $top = (($rows | Select-Object -First 3) | ForEach-Object { $_.tenant + '=' + $_.request_count }) -join ', '
+              if ($top) { Add-Summary 'Top Traffic Tenants' $top 'OK' }
+              else       { Add-Summary 'Top Traffic Tenants' 'none' 'EMPTY' }
+            }
 
       # ── STEP 6 — IS error count ───────────────────────────────────────────
-      - task: AzureCLI@2
+      - task: AzurePowerShell@5
         displayName: 6. IS error count
         continueOnError: true
         inputs:
           azureSubscription: $(AZURE_SERVICE_CONNECTION)
-          scriptType: bash
-          scriptLocation: inlineScript
-          inlineScript: |
-            set -uo pipefail
-            source "$(lib)"; az account set -s $(subscriptionId) 2>/dev/null || true
+          azurePowerShellVersion: LatestVersion
+          pwsh: true
+          ScriptType: InlineScript
+          Inline: |
+            . '$(libps)'
             # Seeded via seed-sample-logs.sh — mirrors ContainerLog + KubePodInventory
             # (ContainerID -> ContainerID_s, Name -> Name_s, LogEntry -> LogEntry_s).
-            kql 'PreflightContainerLog_CL
+            $q = Invoke-Kql 'PreflightContainerLog_CL
               | join kind=inner (PreflightKubePodInventory_CL | project ContainerID_s, PodName = Name_s | distinct *) on ContainerID_s
               | project TimeGenerated, LogEntry_s
               | where LogEntry_s has_cs ": ERROR"
               | summarize Count = count() by bin(TimeGenerated, 1d)
               | project Day = TimeGenerated, Count | order by Day asc'
-            DATA="$QUERY_OUT"
-            echo "$DATA" | jq -r '["Day","ErrorCount"],(.[]|[((.Day // .TimeGenerated)|tostring)[:10],(.Count)])|@csv' > "$WORKDIR/04_IS_Errors.csv"
-            if [ "$QUERY_OK" = 0 ]; then summary "IS Errors" "$QUERY_ERR" FAILED; note "IS Errors FAILED: $QUERY_ERR"
-            elif [ "$(echo "$DATA" | jq 'length')" = 0 ]; then summary "IS Errors" "query ran, 0 rows" EMPTY
-            else
-              PEAK=$(echo "$DATA" | jq -r '[.[].Count|tonumber]|max // 0')
-              STATUS=OK; awk -v p="$PEAK" -v t="${{ parameters.errorCountDailyThreshold }}" 'BEGIN{exit (p>t)?0:1}' \
-                && { STATUS=WARNING; note "IS errors: peak ${PEAK}/day exceeded ${{ parameters.errorCountDailyThreshold }}"; }
-              summary "IS Errors" "peak ${PEAK} errors/day" "$STATUS"
-            fi
+            $rows = $q.Rows
+            $lines = @('"Day","ErrorCount"')
+            foreach ($r in $rows) {
+              $dayVal = if ($r.Day) { $r.Day } else { $r.TimeGenerated }
+              $day = [string]$dayVal; if ($day.Length -ge 10) { $day = $day.Substring(0, 10) }
+              $lines += (Format-CsvField $day) + ',' + [long]$r.Count
+            }
+            $lines | Set-Content -LiteralPath (Join-Path $WorkDir '04_IS_Errors.csv')
+            $threshold = ${{ parameters.errorCountDailyThreshold }}
+            if (-not $q.Ok) {
+              Add-Summary 'IS Errors' $q.Err 'FAILED'; Add-Note ('IS Errors FAILED: ' + $q.Err)
+            } elseif ($rows.Count -eq 0) {
+              Add-Summary 'IS Errors' 'query ran, 0 rows' 'EMPTY'
+            } else {
+              $peak = ($rows | ForEach-Object { [long]$_.Count } | Measure-Object -Maximum).Maximum
+              $status = 'OK'
+              if ($peak -gt $threshold) { $status = 'WARNING'; Add-Note ('IS errors: peak ' + $peak + '/day exceeded ' + $threshold) }
+              Add-Summary 'IS Errors' ('peak ' + $peak + ' errors/day') $status
+            }
 
       # ── STEP 7 — Top error tenants ────────────────────────────────────────
-      - task: AzureCLI@2
+      - task: AzurePowerShell@5
         displayName: 7. Top error tenants
         continueOnError: true
         inputs:
           azureSubscription: $(AZURE_SERVICE_CONNECTION)
-          scriptType: bash
-          scriptLocation: inlineScript
-          inlineScript: |
-            set -uo pipefail
-            source "$(lib)"; az account set -s $(subscriptionId) 2>/dev/null || true
+          azurePowerShellVersion: LatestVersion
+          pwsh: true
+          ScriptType: InlineScript
+          Inline: |
+            . '$(libps)'
             # Seeded via seed-sample-logs.sh — mirrors ContainerLog + KubePodInventory
             # (ContainerID -> ContainerID_s, Name -> Name_s, LogEntry -> LogEntry_s).
-            kql 'let paramPodNamePrefix = "wso2is-deployment";
+            $q = Invoke-Kql 'let paramPodNamePrefix = "wso2is-deployment";
               let errorRegex = ".*iam-cloud-.* : ERROR {.*} .*";
               PreflightContainerLog_CL
               | join kind=inner (PreflightKubePodInventory_CL | project ContainerID_s, PodName = Name_s
@@ -282,168 +355,290 @@ jobs:
               | parse LogEntry_s with * "Tenant: [" TenantName "]" *
               | where isnotempty(TenantName)
               | summarize LogCount = count() by TenantName | top 5 by LogCount desc'
-            DATA="$QUERY_OUT"
-            echo "$DATA" | jq -r '["TenantName","LogCount"],(.[]|[.TenantName,.LogCount])|@csv' > "$WORKDIR/05_Top_Error_Tenants.csv"
-            if [ "$QUERY_OK" = 0 ]; then summary "Top Error Tenants" "$QUERY_ERR" FAILED; note "Top Error Tenants FAILED: $QUERY_ERR"
-            else
-              TOP=$(echo "$DATA" | jq -r '[.[]|"\(.TenantName)=\(.LogCount)"]|.[0:3]|join(", ")')
-              summary "Top Error Tenants" "${TOP:-none}" "$([ -z "$TOP" ] && echo EMPTY || echo OK)"
-            fi
+            $rows = $q.Rows
+            $lines = @('"TenantName","LogCount"')
+            foreach ($r in $rows) { $lines += (Format-CsvField $r.TenantName) + ',' + [long]$r.LogCount }
+            $lines | Set-Content -LiteralPath (Join-Path $WorkDir '05_Top_Error_Tenants.csv')
+            if (-not $q.Ok) {
+              Add-Summary 'Top Error Tenants' $q.Err 'FAILED'; Add-Note ('Top Error Tenants FAILED: ' + $q.Err)
+            } else {
+              $top = (($rows | Select-Object -First 3) | ForEach-Object { $_.TenantName + '=' + $_.LogCount }) -join ', '
+              if ($top) { Add-Summary 'Top Error Tenants' $top 'OK' }
+              else       { Add-Summary 'Top Error Tenants' 'none' 'EMPTY' }
+            }
 
       # ── STEP 8 — API latency (AzureDiagnostics) ───────────────────────────
-      - task: AzureCLI@2
+      - task: AzurePowerShell@5
         displayName: 8. API latency
         continueOnError: true
         inputs:
           azureSubscription: $(AZURE_SERVICE_CONNECTION)
-          scriptType: bash
-          scriptLocation: inlineScript
-          inlineScript: |
-            set -uo pipefail
-            source "$(lib)"; az account set -s $(subscriptionId) 2>/dev/null || true
+          azurePowerShellVersion: LatestVersion
+          pwsh: true
+          ScriptType: InlineScript
+          Inline: |
+            . '$(libps)'
             # Seeded via seed-sample-logs.sh — mirrors AzureDiagnostics (timeTaken_d / requestUri_s unchanged).
-            kql 'PreflightAzureDiagnostics_CL
+            $q = Invoke-Kql 'PreflightAzureDiagnostics_CL
               | where isnotnull(timeTaken_d)
               | summarize AvgSec = round(avg(timeTaken_d), 3) by Endpoint = tostring(requestUri_s)
               | where isnotempty(Endpoint)
               | top 5 by AvgSec desc'
-            DATA="$QUERY_OUT"
-            echo "$DATA" | jq -r '["Endpoint","AvgSeconds"],(.[]|[.Endpoint,(.AvgSec|tonumber)])|@csv' > "$WORKDIR/06_API_Latency.csv"
-            if [ "$QUERY_OK" = 0 ]; then summary "API Latency" "$QUERY_ERR" FAILED; note "API Latency FAILED: $QUERY_ERR"
-            elif [ "$(echo "$DATA" | jq 'length')" = 0 ]; then summary "API Latency" "query ran, 0 rows" EMPTY
-            else
-              MAX=$(echo "$DATA" | jq -r '[.[].AvgSec|tonumber]|max // 0')
-              STATUS=OK; awk -v m="$MAX" -v t="${{ parameters.apiLatencyThresholdSeconds }}" 'BEGIN{exit (m>t)?0:1}' \
-                && { STATUS=WARNING; note "API latency: worst endpoint ${MAX}s over ${{ parameters.apiLatencyThresholdSeconds }}s"; }
-              summary "API Latency" "worst avg ${MAX}s" "$STATUS"
-            fi
+            $rows = $q.Rows
+            $lines = @('"Endpoint","AvgSeconds"')
+            foreach ($r in $rows) { $lines += (Format-CsvField $r.Endpoint) + ',' + [double]$r.AvgSec }
+            $lines | Set-Content -LiteralPath (Join-Path $WorkDir '06_API_Latency.csv')
+            $threshold = ${{ parameters.apiLatencyThresholdSeconds }}
+            if (-not $q.Ok) {
+              Add-Summary 'API Latency' $q.Err 'FAILED'; Add-Note ('API Latency FAILED: ' + $q.Err)
+            } elseif ($rows.Count -eq 0) {
+              Add-Summary 'API Latency' 'query ran, 0 rows' 'EMPTY'
+            } else {
+              $max = ($rows | ForEach-Object { [double]$_.AvgSec } | Measure-Object -Maximum).Maximum
+              $status = 'OK'
+              if ($max -gt $threshold) { $status = 'WARNING'; Add-Note ('API latency: worst endpoint ' + $max + 's over ' + $threshold + 's') }
+              Add-Summary 'API Latency' ('worst avg ' + $max + 's') $status
+            }
 
       # ── STEP 9 — SQL DB storage ───────────────────────────────────────────
-      - task: AzureCLI@2
+      - task: AzurePowerShell@5
         displayName: 9. SQL DB storage
         continueOnError: true
         inputs:
           azureSubscription: $(AZURE_SERVICE_CONNECTION)
-          scriptType: bash
-          scriptLocation: inlineScript
-          inlineScript: |
-            set -uo pipefail
-            source "$(lib)"; az account set -s $(subscriptionId) 2>/dev/null || true
-            CSV="$WORKDIR/07_SQL_Storage.csv"; jq -rn '["Database","MaxGB","UsedPercent","Status"]|@csv' > "$CSV"
-            if [ -z "$(sqlServer)" ]; then
-              jq -rn '["(not configured)","","","SKIP"]|@csv' >> "$CSV"; summary "SQL Storage" "not configured" SKIP; exit 0
-            fi
-            WARN=0; N=0
-            for DB in $(az sql db list -g $(resourceGroup) -s $(sqlServer) --query "[?name!='master'].name" -o tsv); do
-              N=$((N+1)); U=$(az sql db list-usages -g $(resourceGroup) -s $(sqlServer) -n "$DB" -o json)
-              USED=$(echo "$U" | jq -r '.[]|select(.name=="database_size")|.currentValue')
-              MAX=$(echo  "$U" | jq -r '.[]|select(.name=="database_size")|.limit')
-              read -r GB PCT <<<"$(awk -v u="$USED" -v m="$MAX" 'BEGIN{printf "%.2f %.1f", m/(1024^3), u/m*100}')"
-              DBSTATUS=OK; awk -v p="$PCT" -v w="${{ parameters.sqlStorageWarnPercent }}" 'BEGIN{exit (p<w)?0:1}' || { DBSTATUS=ALERT; WARN=1; }
-              jq -rn --arg d "$DB" --arg g "$GB" --arg p "$PCT" --arg s "$DBSTATUS" '[$d,($g|tonumber),($p|tonumber),$s]|@csv' >> "$CSV"
-            done
-            [ "$WARN" = 1 ] && note "SQL database(s) over ${{ parameters.sqlStorageWarnPercent }}% storage" || true
-            summary "SQL Storage" "${N} db(s) checked" "$([ "$WARN" = 1 ] && echo ALERT || echo OK)"
+          azurePowerShellVersion: LatestVersion
+          pwsh: true
+          ScriptType: InlineScript
+          Inline: |
+            . '$(libps)'
+            $sqlServer = '$(sqlServer)'
+            $rg        = '$(resourceGroup)'
+            $warnPct   = ${{ parameters.sqlStorageWarnPercent }}
+            $csvPath   = Join-Path $WorkDir '07_SQL_Storage.csv'
+            $lines     = @('"Database","MaxGB","UsedPercent","Status"')
+            if (-not $sqlServer) {
+              $lines += '"(not configured)","","","SKIP"'
+              $lines | Set-Content -LiteralPath $csvPath
+              Add-Summary 'SQL Storage' 'not configured' 'SKIP'
+            } else {
+              $warn = $false; $n = 0
+              $dbs = Get-AzSqlDatabase -ResourceGroupName $rg -ServerName $sqlServer |
+                       Where-Object { $_.DatabaseName -ne 'master' }
+              foreach ($db in $dbs) {
+                $n++
+                # database_size: currentValue (used) vs limit (max). MaxSizeBytes is the
+                # limit; used bytes come from the 'storage' metric (last non-null point).
+                $maxBytes  = [double]$db.MaxSizeBytes
+                $usedBytes = 0.0
+                try {
+                  $m = Get-AzMetric -ResourceId $db.ResourceId -MetricName 'storage' -AggregationType Maximum `
+                         -WarningAction SilentlyContinue -ErrorAction Stop
+                  $pts = $m.Data | Where-Object { $null -ne $_.Maximum }
+                  if ($pts) { $usedBytes = [double]$pts[-1].Maximum }
+                } catch {}
+                $gb  = $maxBytes / 1GB
+                $pct = if ($maxBytes -gt 0) { $usedBytes / $maxBytes * 100 } else { 0 }
+                $dbStatus = 'OK'
+                if ($pct -ge $warnPct) { $dbStatus = 'ALERT'; $warn = $true }
+                $lines += (Format-CsvField $db.DatabaseName) + ',' + ('{0:F2}' -f $gb) + ',' + ('{0:F1}' -f $pct) + ',' + (Format-CsvField $dbStatus)
+              }
+              $lines | Set-Content -LiteralPath $csvPath
+              if ($warn) { Add-Note ('SQL database(s) over ' + $warnPct + '% storage') }
+              $overall = if ($warn) { 'ALERT' } else { 'OK' }
+              Add-Summary 'SQL Storage' ($n.ToString() + ' db(s) checked') $overall
+            }
 
       # ── STEP 10 — Archival storage size ───────────────────────────────────
-      - task: AzureCLI@2
+      - task: AzurePowerShell@5
         displayName: 10. Archival storage size
         continueOnError: true
         inputs:
           azureSubscription: $(AZURE_SERVICE_CONNECTION)
-          scriptType: bash
-          scriptLocation: inlineScript
-          inlineScript: |
-            set -uo pipefail
-            source "$(lib)"; az account set -s $(subscriptionId) 2>/dev/null || true
-            CSV="$WORKDIR/08_Archival_Storage.csv"; jq -rn '["StorageAccount","GiBUsed"]|@csv' > "$CSV"
-            START=$(date -u -d "2 days ago" +%Y-%m-%dT%H:%MZ); N=0
-            for ID in $(az storage account list -g $(resourceGroup) --query "[].id" -o tsv); do
-              BYTES=$(az monitor metrics list --resource "$ID" --metric UsedCapacity --aggregation Average \
-                --start-time "$START" --interval PT1H --query "value[0].timeseries[0].data[?average!=null].average | [-1]" -o tsv 2>/dev/null || echo "")
-              [ -n "$BYTES" ] && [ "$BYTES" != "None" ] || continue
-              N=$((N+1)); jq -rn --arg a "${ID##*/}" --arg g "$(awk -v b="$BYTES" 'BEGIN{printf "%.2f",b/1073741824}')" '[$a,($g|tonumber)]|@csv' >> "$CSV"
-            done
-            summary "Archival Storage" "${N} account(s)" "$([ "$N" = 0 ] && echo EMPTY || echo OK)"
+          azurePowerShellVersion: LatestVersion
+          pwsh: true
+          ScriptType: InlineScript
+          Inline: |
+            . '$(libps)'
+            $rg      = '$(resourceGroup)'
+            $csvPath = Join-Path $WorkDir '08_Archival_Storage.csv'
+            $lines   = @('"StorageAccount","GiBUsed"')
+            $start   = [datetime]::UtcNow.AddDays(-2)
+            $n = 0
+            foreach ($sa in Get-AzStorageAccount -ResourceGroupName $rg) {
+              try {
+                $m = Get-AzMetric -ResourceId $sa.Id -MetricName 'UsedCapacity' -AggregationType Average `
+                       -StartTime $start -EndTime ([datetime]::UtcNow) -TimeGrain ([timespan]::FromHours(1)) `
+                       -WarningAction SilentlyContinue -ErrorAction Stop
+                $pts = $m.Data | Where-Object { $null -ne $_.Average }
+                if (-not $pts) { continue }
+                $bytes = [double]$pts[-1].Average
+              } catch { continue }
+              $n++
+              $lines += (Format-CsvField $sa.StorageAccountName) + ',' + ('{0:F2}' -f ($bytes / 1GB))
+            }
+            $lines | Set-Content -LiteralPath $csvPath
+            $status = if ($n -eq 0) { 'EMPTY' } else { 'OK' }
+            Add-Summary 'Archival Storage' ($n.ToString() + ' account(s)') $status
 
       # ── STEP 11 — Certificate expiry ──────────────────────────────────────
-      - task: AzureCLI@2
+      - task: AzurePowerShell@5
         displayName: 11. Certificate expiry
         continueOnError: true
         inputs:
           azureSubscription: $(AZURE_SERVICE_CONNECTION)
-          scriptType: bash
-          scriptLocation: inlineScript
-          inlineScript: |
-            set -uo pipefail
-            source "$(lib)"; az account set -s $(subscriptionId) 2>/dev/null || true
-            CSV="$WORKDIR/09_Certificates.csv"; jq -rn '["Vault","Certificate","DaysRemaining","Status"]|@csv' > "$CSV"
-            NOW=$(date -u +%s)
-            for VAULT in $(az keyvault list --query "[].name" -o tsv); do
-              az keyvault certificate list --vault-name "$VAULT" --query "[].{name:name,exp:attributes.expires}" -o json | jq -c '.[]' | while read -r C; do
-                NAME=$(echo "$C" | jq -r '.name'); EXP=$(echo "$C" | jq -r '.exp'); [ "$EXP" = "null" ] && continue
-                EXP_EPOCH=$(date -u -d "$EXP" +%s 2>/dev/null || echo 0); [ "$EXP_EPOCH" = "0" ] && continue
-                DAYS=$(( (EXP_EPOCH - NOW) / 86400 )); STATUS=OK
-                [ "$DAYS" -lt 0 ] && STATUS=EXPIRED
-                [ "$DAYS" -ge 0 ] && [ "$DAYS" -lt "${{ parameters.certExpiryWarningDays }}" ] && STATUS=EXPIRING
-                jq -rn --arg v "$VAULT" --arg n "$NAME" --arg d "$DAYS" --arg s "$STATUS" '[$v,$n,($d|tonumber),$s]|@csv' >> "$CSV"
-                [ "$STATUS" != "OK" ] && echo "Cert ${VAULT}/${NAME}: ${STATUS} (${DAYS}d)" >> "$WARNINGS" || true
-              done
-            done
-            summary "Certificates" "expiry scan" "$(grep -q 'EXPIR' "$WARNINGS" && echo WARNING || echo OK)"
+          azurePowerShellVersion: LatestVersion
+          pwsh: true
+          ScriptType: InlineScript
+          Inline: |
+            . '$(libps)'
+            $warnDays = ${{ parameters.certExpiryWarningDays }}
+            $csvPath  = Join-Path $WorkDir '09_Certificates.csv'
+            $lines    = @('"Vault","Certificate","DaysRemaining","Status"')
+            $now      = [datetime]::UtcNow
+            $expiring = $false
+            foreach ($v in Get-AzKeyVault) {
+              try { $certs = Get-AzKeyVaultCertificate -VaultName $v.VaultName -ErrorAction Stop } catch { continue }
+              foreach ($c in $certs) {
+                if (-not $c.Expires) { continue }   # mirrors the bash `exp == null` skip
+                $days = [int][math]::Truncate(($c.Expires.ToUniversalTime() - $now).TotalDays)
+                $status = 'OK'
+                if ($days -lt 0) { $status = 'EXPIRED' }
+                elseif ($days -lt $warnDays) { $status = 'EXPIRING' }
+                $lines += (Format-CsvField $v.VaultName) + ',' + (Format-CsvField $c.Name) + ',' + $days + ',' + (Format-CsvField $status)
+                if ($status -ne 'OK') {
+                  Add-Note ('Cert ' + $v.VaultName + '/' + $c.Name + ': ' + $status + ' (' + $days + 'd)')
+                  $expiring = $true
+                }
+              }
+            }
+            $lines | Set-Content -LiteralPath $csvPath
+            $status = if ($expiring) { 'WARNING' } else { 'OK' }
+            Add-Summary 'Certificates' 'expiry scan' $status
 
       # ── STEP 12 — Weekly cost ─────────────────────────────────────────────
-      - task: AzureCLI@2
+      #   Uses the Az PowerShell Cost Management cmdlet (Invoke-AzCostManagementQuery)
+      #   instead of `az rest` — the service connection wires up the Az context, so
+      #   there is no hand-rolled REST URL/body/JSON-parsing to maintain.
+      - task: AzurePowerShell@5
         displayName: 12. Weekly cost
         continueOnError: true
         inputs:
           azureSubscription: $(AZURE_SERVICE_CONNECTION)
-          scriptType: bash
-          scriptLocation: inlineScript
-          inlineScript: |
-            set -uo pipefail
-            source "$(lib)"; az account set -s $(subscriptionId) 2>/dev/null || true
-            CW_END=$(date -u -d "yesterday" +%F); CW_START=$(date -u -d "8 days ago" +%F)
-            PW_END=$(date -u -d "9 days ago" +%F); PW_START=$(date -u -d "15 days ago" +%F)
-            cost() { az rest --method POST \
-              --url "https://management.azure.com/subscriptions/$(subscriptionId)/providers/Microsoft.CostManagement/query?api-version=2023-11-01" \
-              --body "{\"type\":\"ActualCost\",\"timeframe\":\"Custom\",\"timePeriod\":{\"from\":\"$1\",\"to\":\"$2\"},\"dataset\":{\"granularity\":\"None\",\"aggregation\":{\"totalCost\":{\"name\":\"Cost\",\"function\":\"Sum\"}}}}" \
-              --query "properties.rows[0][0]" -o tsv 2>/dev/null; }
-            CW=$(cost "$CW_START" "$CW_END"); PW=$(cost "$PW_START" "$PW_END")
-            CSV="$WORKDIR/10_Weekly_Cost.csv"; jq -rn '["Period","Cost"]|@csv' > "$CSV"
-            jq -rn --arg p "This week ($CW_START..$CW_END)"  --arg c "${CW:-0}" '[$p,($c|tonumber)]|@csv' >> "$CSV"
-            jq -rn --arg p "Prior week ($PW_START..$PW_END)" --arg c "${PW:-0}" '[$p,($c|tonumber)]|@csv' >> "$CSV"
-            if [ -z "$CW" ] && [ -z "$PW" ]; then summary "Weekly Cost" "cost query returned nothing" FAILED; note "Weekly Cost FAILED — check Cost Management permissions."
-            else
-              STATUS=OK; R="this \$$(printf '%.2f' "${CW:-0}") vs prior \$$(printf '%.2f' "${PW:-0}")"
-              if awk -v c="${CW:-0}" -v p="${PW:-0}" -v t="${{ parameters.costIncreasePercentThreshold }}" 'BEGIN{exit (p>0 && (c-p)/p*100>t)?0:1}'; then
-                STATUS=WARNING; PCT=$(awk -v c="$CW" -v p="$PW" 'BEGIN{printf "%.1f",(c-p)/p*100}')
-                R="$R (+${PCT}%)"; note "Cost up ${PCT}% week-over-week"
-              fi
-              summary "Weekly Cost" "$R" "$STATUS"
-            fi
+          azurePowerShellVersion: LatestVersion
+          pwsh: true
+          ScriptType: InlineScript
+          Inline: |
+            $ErrorActionPreference = 'Stop'
+            . '$(libps)'   # Invoke-Kql/Add-Summary/Add-Note/Format-CsvField/Or-Zero
+
+            $sub           = '$(subscriptionId)'
+            $rg            = '$(resourceGroup)'
+            $costCsv       = Join-Path $WorkDir '10_Weekly_Cost.csv'
+            $costThreshold = ${{ parameters.costIncreasePercentThreshold }}
+
+            # 10_Weekly_Cost.csv — Cost stays a bare number, matching the jq @csv rows.
+            '"Scope","Period","Cost","Note"' | Set-Content -LiteralPath $costCsv
+            function Add-CostRow($scope, $period, $cost, $note) {
+              $c = 0.0; [double]::TryParse([string]$cost, [ref]$c) | Out-Null
+              ('{0},{1},{2},{3}' -f (Format-CsvField $scope), (Format-CsvField $period), $c, (Format-CsvField $note)) |
+                Add-Content -LiteralPath $costCsv
+            }
+
+            # Get-Cost <scope> <from> <to> -> @{ Out = <double|$null>; Err = '<why empty>' }.
+            # An empty result says WHY it was empty — 403/permission vs "0 rows" (no
+            # billed usage) vs unsupported offer — never a blanket "returned nothing".
+            function Get-Cost($scope, [datetime]$from, [datetime]$to) {
+              try {
+                $q = Invoke-AzCostManagementQuery -Scope $scope -Type ActualCost -Timeframe Custom `
+                       -TimePeriodFrom $from -TimePeriodTo $to `
+                       -DatasetGranularity None `
+                       -DatasetAggregation @{ totalCost = @{ name = 'Cost'; function = 'Sum' } } -ErrorAction Stop
+                if ($q.Row -and $q.Row.Count -gt 0 -and $null -ne $q.Row[0][0]) {
+                  return @{ Out = [double]$q.Row[0][0]; Err = '' }
+                }
+                return @{ Out = $null; Err = 'query ok but 0 rows (no billed usage in window)' }
+              } catch {
+                $msg = ($_.Exception.Message -replace '\s+', ' ').Trim()
+                if (-not $msg) { $msg = 'Invoke-AzCostManagementQuery failed (empty error)' }
+                if ($msg.Length -gt 200) { $msg = $msg.Substring(0, 200) }
+                return @{ Out = $null; Err = $msg }
+              }
+            }
+
+            # Weekly windows (UTC): this week = last 7 full days, prior = the 7 before.
+            $today   = [datetime]::UtcNow.Date
+            $cwEnd   = $today.AddDays(-1);  $cwStart = $today.AddDays(-8)
+            $pwEnd   = $today.AddDays(-9);  $pwStart = $today.AddDays(-15)
+            $cwLabel = 'This week ('  + $cwStart.ToString('yyyy-MM-dd') + '..' + $cwEnd.ToString('yyyy-MM-dd') + ')'
+            $pwLabel = 'Prior week (' + $pwStart.ToString('yyyy-MM-dd') + '..' + $pwEnd.ToString('yyyy-MM-dd') + ')'
+
+            $subScope = 'subscriptions/' + $sub
+            $rgScope  = 'subscriptions/' + $sub + '/resourceGroups/' + $rg
+
+            # ── Subscription scope ──
+            $subCw = Get-Cost $subScope $cwStart $cwEnd
+            $subPw = Get-Cost $subScope $pwStart $pwEnd
+            Add-CostRow 'Subscription' $cwLabel (Or-Zero $subCw.Out) $subCw.Err
+            Add-CostRow 'Subscription' $pwLabel (Or-Zero $subPw.Out) $subPw.Err
+
+            # ── Resource-group scope — analysed too, to tell a subscription-level
+            #    permission/scope problem apart from genuine no-data ──
+            $rgCw = Get-Cost $rgScope $cwStart $cwEnd
+            $rgPw = Get-Cost $rgScope $pwStart $pwEnd
+            Add-CostRow ('RG ' + $rg) $cwLabel (Or-Zero $rgCw.Out) $rgCw.Err
+            Add-CostRow ('RG ' + $rg) $pwLabel (Or-Zero $rgPw.Out) $rgPw.Err
+
+            # ── Verdict: prefer subscription scope; surface the real reason on empty ──
+            if ($null -ne $subCw.Out -or $null -ne $subPw.Out) {
+              $c = [double](Or-Zero $subCw.Out); $p = [double](Or-Zero $subPw.Out)
+              $status = 'OK'
+              $result = 'this $' + ('{0:F2}' -f $c) + ' vs prior $' + ('{0:F2}' -f $p)
+              if ($p -gt 0 -and ((($c - $p) / $p) * 100) -gt $costThreshold) {
+                $status = 'WARNING'
+                $pct = '{0:F1}' -f ((($c - $p) / $p) * 100)
+                $result = $result + ' (+' + $pct + '%)'
+                Add-Note ('Cost up ' + $pct + '% week-over-week')
+              }
+              Add-Summary 'Weekly Cost' $result $status
+            }
+            elseif ($null -ne $rgCw.Out -or $null -ne $rgPw.Out) {
+              $rgS = '{0:F2}' -f (Or-Zero $rgCw.Out)
+              Add-Summary 'Weekly Cost' ('sub scope empty (' + $subCw.Err + '); RG ' + $rg + ' = $' + $rgS) 'WARNING'
+              Add-Note ('Weekly Cost: subscription scope empty (' + $subCw.Err + ') but RG ' + $rg + ' has data — this is a subscription-level scope/permission gap, not missing data.')
+            }
+            else {
+              Add-Summary 'Weekly Cost' ('returned nothing — sub: ' + $subCw.Err + ' | rg: ' + $rgCw.Err) 'FAILED'
+              Add-Note ('Weekly Cost FAILED — sub scope: ' + $subCw.Err + '; rg scope: ' + $rgCw.Err + ". If both say 403/permission, grant the SP 'Cost Management Reader'.")
+            }
 
       # ── STEP 13 — Secure score (with list fallback) ───────────────────────
-      - task: AzureCLI@2
+      - task: AzurePowerShell@5
         displayName: 13. Secure score
         continueOnError: true
         inputs:
           azureSubscription: $(AZURE_SERVICE_CONNECTION)
-          scriptType: bash
-          scriptLocation: inlineScript
-          inlineScript: |
-            set -uo pipefail
-            source "$(lib)"; az account set -s $(subscriptionId) 2>/dev/null || true
-            SS=$(az security secure-scores show --name ascScore -o json 2>/dev/null \
-              || az security secure-scores list -o json 2>/dev/null | jq '.[0]' || echo '{}')
-            PCT=$(echo "$SS" | jq -r '.score.percentage // .properties.score.percentage // empty')
-            CSV="$WORKDIR/11_Secure_Score.csv"; jq -rn '["Metric","Value"]|@csv' > "$CSV"
-            if [ -n "$PCT" ]; then
-              VAL="$(awk -v p="$PCT" 'BEGIN{printf "%.0f%%",p*100}')"
-              jq -rn --arg v "$VAL" '["Secure Score",$v]|@csv' >> "$CSV"; summary "Secure Score" "$VAL" OK
-            else
-              jq -rn '["Secure Score","unavailable"]|@csv' >> "$CSV"; summary "Secure Score" "unavailable (Defender plan / permissions)" SKIP
-            fi
+          azurePowerShellVersion: LatestVersion
+          pwsh: true
+          ScriptType: InlineScript
+          Inline: |
+            . '$(libps)'
+            # Prefer the overall 'ascScore'; fall back to the first score in the list.
+            $pct = $null
+            try { $pct = (Get-AzSecuritySecureScore -Name 'ascScore' -ErrorAction Stop).PercentageScore }
+            catch {
+              try { $pct = (Get-AzSecuritySecureScore -ErrorAction Stop | Select-Object -First 1).PercentageScore } catch {}
+            }
+            $csvPath = Join-Path $WorkDir '11_Secure_Score.csv'
+            $lines   = @('"Metric","Value"')
+            if ($null -ne $pct -and "$pct" -ne '') {
+              $val = '{0:F0}%' -f ([double]$pct * 100)
+              $lines += '"Secure Score",' + (Format-CsvField $val)
+              Add-Summary 'Secure Score' $val 'OK'
+            } else {
+              $lines += '"Secure Score","unavailable"'
+              Add-Summary 'Secure Score' 'unavailable (Defender plan / permissions)' 'SKIP'
+            }
+            $lines | Set-Content -LiteralPath $csvPath
 
       # ── STEP 14 — AKS pods + nodes ────────────────────────────────────────
       - task: Kubernetes@1
@@ -502,22 +697,31 @@ jobs:
         condition: always()
 
       # ── STEP 17 — upload the .xlsx report to blob: sa18436/preflight ──────
-      - task: AzureCLI@2
+      - task: AzurePowerShell@5
         displayName: 17. Upload report to blob (sa18436/preflight)
         condition: always()
         inputs:
           azureSubscription: $(AZURE_SERVICE_CONNECTION)
-          scriptType: bash
-          scriptLocation: inlineScript
-          inlineScript: |
-            set -euo pipefail
-            [ -n "${REPORTPATH:-}" ] && [ -f "$REPORTPATH" ] || { echo "No .xlsx report — nothing to upload."; exit 0; }
-            KEY=$(az storage account keys list --account-name $(storageAccount) -g $(resourceGroup) --query "[0].value" -o tsv)
-            az storage container create --account-name $(storageAccount) --account-key "$KEY" --name $(blobContainer) --only-show-errors -o none
-            PREFIX="preflight-$(date -u '+%Y-%m-%d-%H%M')"
-            az storage blob upload --account-name $(storageAccount) --account-key "$KEY" \
-              --container-name $(blobContainer) --file "$REPORTPATH" --name "${PREFIX}/$(basename "$REPORTPATH")" --overwrite -o none
-            echo "Uploaded $(basename "$REPORTPATH") to $(storageAccount)/$(blobContainer)/${PREFIX}/"
+          azurePowerShellVersion: LatestVersion
+          pwsh: true
+          ScriptType: InlineScript
+          Inline: |
+            $reportPath = $env:REPORTPATH
+            if (-not $reportPath -or -not (Test-Path -LiteralPath $reportPath)) {
+              Write-Host 'No .xlsx report — nothing to upload.'
+            } else {
+              $acct = '$(storageAccount)'; $rg = '$(resourceGroup)'; $container = '$(blobContainer)'
+              $key = (Get-AzStorageAccountKey -ResourceGroupName $rg -Name $acct)[0].Value
+              $ctx = New-AzStorageContext -StorageAccountName $acct -StorageAccountKey $key
+              if (-not (Get-AzStorageContainer -Name $container -Context $ctx -ErrorAction SilentlyContinue)) {
+                New-AzStorageContainer -Name $container -Context $ctx | Out-Null
+              }
+              $prefix   = 'preflight-' + [datetime]::UtcNow.ToString('yyyy-MM-dd-HHmm')
+              $fileName = Split-Path -Leaf $reportPath
+              Set-AzStorageBlobContent -File $reportPath -Container $container `
+                -Blob ($prefix + '/' + $fileName) -Context $ctx -Force | Out-Null
+              Write-Host ('Uploaded ' + $fileName + ' to ' + $acct + '/' + $container + '/' + $prefix + '/')
+            }
         env:
           REPORTPATH: $(reportPath)
 
