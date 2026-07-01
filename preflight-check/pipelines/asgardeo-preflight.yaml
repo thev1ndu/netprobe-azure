@@ -53,10 +53,24 @@ jobs:
 
       # ── STEP 0 — tools on the agent (the original `az not found` fix) ──────
       - bash: |
-          set -euo pipefail
-          command -v az      >/dev/null 2>&1 || curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
-          command -v jq      >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y jq; }
-          command -v python3 >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y python3; }
+          set -uo pipefail
+          # Retry wrapper — apt on this vmss agent intermittently fails with exit
+          # 100 (dpkg/apt lock held, stale package lists, transient network). A
+          # single blip must NOT abort the whole install, so retry then fall back.
+          retry() { local n=0; until "$@"; do n=$((n+1)); [ "$n" -ge 4 ] && return 1; echo "retry $n/3: $*"; sleep 10; done; }
+
+          if ! command -v az >/dev/null 2>&1; then
+            echo "Azure CLI not found — installing…"
+            retry sudo apt-get update -y || true
+            retry sudo apt-get install -y ca-certificates curl apt-transport-https lsb-release gnupg || true
+            # Primary: Microsoft's install script. Fallback: distro azure-cli package.
+            retry sudo bash -c 'curl -sL https://aka.ms/InstallAzureCLIDeb | bash' \
+              || retry sudo apt-get install -y azure-cli \
+              || { echo "##[error]Could not install Azure CLI on this agent."; exit 1; }
+          fi
+          command -v jq      >/dev/null 2>&1 || retry sudo bash -c 'apt-get update -y && apt-get install -y jq'      || { echo "##[error]Could not install jq.";      exit 1; }
+          command -v python3 >/dev/null 2>&1 || retry sudo bash -c 'apt-get update -y && apt-get install -y python3' || { echo "##[error]Could not install python3."; exit 1; }
+          echo "Versions:"; az version 2>/dev/null | head -n 20 || true; jq --version; python3 --version
         displayName: 0. Install az + jq + python3
 
       # ── STEP 1 — output dir, Summary header, and shared helpers ───────────
