@@ -34,16 +34,16 @@ parameters:
 variables:
   NODE_NO_WARNINGS: 1
   AZURE_SERVICE_CONNECTION: thevindu-rnd-sc
-  workDir:              $(Build.ArtifactStagingDirectory)/checks     # one CSV per check (intermediate, not published)
-  reportDir:            $(Build.ArtifactStagingDirectory)/report     # holds only the published .xlsx
+  workDir:              $(Build.ArtifactStagingDirectory)/checks
+  reportDir:            $(Build.ArtifactStagingDirectory)/report
   warnings:             $(Build.ArtifactStagingDirectory)/warnings.txt
-  lib:                  $(Build.ArtifactStagingDirectory)/lib.sh     # shared bash helpers
-  libps:                $(Build.ArtifactStagingDirectory)/lib.ps1    # shared Az PowerShell helpers
+  lib:                  $(Build.ArtifactStagingDirectory)/lib.sh
+  libps:                $(Build.ArtifactStagingDirectory)/lib.ps1
   subscriptionId:       '38785beb-5019-4896-8679-3d41ddacc4b1'
   resourceGroup:        'rg-thevindu'
   workspaceId:          'e5d406b5-f761-48a7-9466-9d0d4a768f01'
-  keyVaultNames:        'kv-preflight-thevindu'  # comma-separated; empty = skip cert check
-  sqlServer:            ''                      # empty = skip SQL check
+  keyVaultNames:        'kv-preflight-thevindu'
+  sqlServer:            ''
   aksServiceConnection: 'rnd-aks-thevindu'
   storageAccount:       'sa18436'
   blobContainer:        'preflight'
@@ -55,39 +55,27 @@ jobs:
     pool:
       name: ${{ parameters.agentPool }}
     steps:
-      - checkout: self   # need build-xlsx.py on the agent to render the report
+      - checkout: self
 
-      # ── STEP 0 — tools on the agent (the original `az not found` fix) ──────
       - bash: |
           set -uo pipefail
-          # Retry wrapper — apt on this vmss agent intermittently fails with exit
-          # 100 (dpkg/apt lock held, stale package lists, transient network). A
-          # single blip must NOT abort the whole install, so retry then fall back.
           retry() { local n=0; until "$@"; do n=$((n+1)); [ "$n" -ge 4 ] && return 1; echo "retry $n/3: $*"; sleep 10; done; }
 
           if ! command -v az >/dev/null 2>&1; then
             echo "Azure CLI not found — installing…"
             retry sudo apt-get update -y || true
             retry sudo apt-get install -y ca-certificates curl apt-transport-https lsb-release gnupg || true
-            # Primary: Microsoft's install script. Fallback: distro azure-cli package.
             retry sudo bash -c 'curl -sL https://aka.ms/InstallAzureCLIDeb | bash' \
               || retry sudo apt-get install -y azure-cli \
               || { echo "##[error]Could not install Azure CLI on this agent."; exit 1; }
           fi
           command -v jq      >/dev/null 2>&1 || retry sudo bash -c 'apt-get update -y && apt-get install -y jq'      || { echo "##[error]Could not install jq.";      exit 1; }
           command -v python3 >/dev/null 2>&1 || retry sudo bash -c 'apt-get update -y && apt-get install -y python3' || { echo "##[error]Could not install python3."; exit 1; }
-          # openpyxl renders the multi-sheet .xlsx report in step 15.
           python3 -c 'import openpyxl' 2>/dev/null || retry sudo bash -c 'apt-get update -y && apt-get install -y python3-pip' || true
           python3 -c 'import openpyxl' 2>/dev/null || retry pip3 install --quiet openpyxl || { echo "##[error]Could not install openpyxl."; exit 1; }
 
-          # ── PowerShell (pwsh) + Az modules ────────────────────────────────
-          # Every AzurePowerShell@5 task below runs on pwsh. A bare VMSS agent
-          # has neither pwsh nor the Az modules, so those tasks (and their
-          # cleanup) failed with "Unable to locate executable file: 'pwsh'".
-          # Install both here so the checks can actually run.
           if ! command -v pwsh >/dev/null 2>&1; then
             echo "PowerShell (pwsh) not found — installing…"
-            # Primary: Microsoft's apt repo for this Ubuntu release. Fallback: snap.
             retry sudo bash -c '
               set -e
               . /etc/os-release
@@ -98,9 +86,6 @@ jobs:
             ' || retry sudo snap install powershell --classic \
               || { echo "##[error]Could not install PowerShell (pwsh)."; exit 1; }
           fi
-          # Install only the Az submodules the checks call (not the full Az
-          # meta-module) to keep this fast. AllUsers scope lands them in the
-          # default PSModulePath so the AzurePowerShell@5 tasks discover them.
           retry sudo pwsh -NoProfile -NonInteractive -Command '
             $ErrorActionPreference = "Stop"
             Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
@@ -117,10 +102,6 @@ jobs:
           echo "Versions:"; az version 2>/dev/null | head -n 20 || true; jq --version; python3 --version; python3 -c 'import openpyxl; print("openpyxl", openpyxl.__version__)'; pwsh --version
         displayName: 0. Install az + jq + python3 + pwsh
 
-      # ── STEP 1 — output dir, Summary header, and shared helpers ───────────
-      #   kql()     runs a query; sets QUERY_OK (1/0) + QUERY_ERR; prints JSON or [].
-      #   summary() appends one row to 00_Summary.csv.
-      #   note()    appends a line for the Google Chat card.
       - bash: |
           set -euo pipefail
           mkdir -p "$(workDir)"; : > "$(warnings)"
@@ -131,23 +112,14 @@ jobs:
           export SUMMARY="$(workDir)/00_Summary.csv"
           export WORKSPACE_ID="$(workspaceId)"
           export LOOKBACK=${{ parameters.lookbackDays }}
-          # Silence az core warnings (e.g. the cdn/afd deprecation banner) so they
-          # can't leak onto stderr and mask the real error in QUERY_ERR. Errors are
-          # still shown.
           export AZURE_CORE_ONLY_SHOW_ERRORS=true
           EOF
           cat >> "$(lib)" <<'EOF'
-          # NOTE: kql returns its output in the global QUERY_OUT (NOT via stdout).
-          #   Callers must invoke it directly — `kql '...'; DATA="$QUERY_OUT"` —
-          #   never as `DATA=$(kql ...)`, because a command-substitution subshell
-          #   would discard QUERY_OK/QUERY_ERR and trip `set -u` in the parent.
           kql() {
             local err; err=$(mktemp); QUERY_OK=1; QUERY_ERR=""; QUERY_OUT='[]'
             if QUERY_OUT=$(az monitor log-analytics query -w "$WORKSPACE_ID" --timespan "P${LOOKBACK}D" --analytics-query "$1" -o json 2>"$err"); then
               :
             else
-              # Drop WARNING/deprecation lines first so the genuine error (not an
-              # az banner) is what survives the 200-char truncation.
               QUERY_OK=0; QUERY_ERR=$(grep -vi '^WARNING' "$err" | tr '\n' ' ' | tr '"' "'" | head -c 200); QUERY_OUT='[]'
             fi
             rm -f "$err"
@@ -155,19 +127,13 @@ jobs:
           summary() { jq -rn --arg c "$1" --arg r "$2" --arg s "$3" '[$c,$r,$s]|@csv' >> "$SUMMARY"; }
           note()    { echo "$1" >> "$WARNINGS"; }
           EOF
-          # lib.ps1 — the AzurePowerShell@5 mirror of lib.sh. DevOps macros ($(workDir)
-          # etc.) are expanded before bash runs, so the quoted heredoc is safe.
           cat > "$(libps)" <<'PSEOF'
-          # Shared Az PowerShell helpers. Dot-source at the top of a step:  . '$(libps)'
           $script:WorkDir     = '$(workDir)'
           $script:Warnings    = '$(warnings)'
           $script:SummaryCsv  = Join-Path '$(workDir)' '00_Summary.csv'
           $script:WorkspaceId = '$(workspaceId)'
           $script:Lookback    = ${{ parameters.lookbackDays }}
 
-          # Invoke-Kql <query> -> @{ Ok=<bool>; Err='<why>'; Rows=@(<row objects>) }.
-          # Mirrors lib.sh kql(): never throws. Ok=$false carries the real error
-          # (permission/syntax) trimmed to 200 chars; Ok=$true + empty Rows = 0 rows.
           function Invoke-Kql([string]$Query) {
             try {
               $r = Invoke-AzOperationalInsightsQuery -WorkspaceId $script:WorkspaceId `
@@ -180,11 +146,9 @@ jobs:
             }
           }
 
-          # CSV escaping matching jq @csv: quote strings, double embedded quotes.
           function Format-CsvField($v) { '"' + ([string]$v -replace '"', '""') + '"' }
           function Or-Zero($v) { if ($null -ne $v) { $v } else { 0 } }
 
-          # summary()/note() equivalents — append to the same files the bash lib writes.
           function Add-Summary($Check, $Result, $Status) {
             ('{0},{1},{2}' -f (Format-CsvField $Check), (Format-CsvField $Result), (Format-CsvField $Status)) |
               Add-Content -LiteralPath $script:SummaryCsv
@@ -193,7 +157,6 @@ jobs:
           PSEOF
         displayName: 1. Init outputs + helpers
 
-      # ── STEP 2 — AUTH PROBE: permission problem vs genuine no-data ────────
       - task: AzurePowerShell@5
         displayName: 2. Verify access (auth probe)
         continueOnError: true
@@ -223,7 +186,6 @@ jobs:
               Add-Note ("Log Analytics query API FAILED (likely missing 'Log Analytics Reader' on workspace): " + $probe.Err)
             }
 
-      # ── STEP 3 — Log ingestion volume ─────────────────────────────────────
       - task: AzurePowerShell@5
         displayName: 3. Log ingestion volume
         continueOnError: true
@@ -234,7 +196,6 @@ jobs:
           ScriptType: InlineScript
           Inline: |
             . '$(libps)'
-            # Seeded via seed-sample-logs.sh — mirrors built-in Usage (Quantity -> Quantity_d).
             $q = Invoke-Kql 'PreflightUsage_CL
               | summarize TotalVolumeGB = sum(Quantity_d / 1000.) by bin(TimeGenerated, 1d)
               | project Day = TimeGenerated, TotalVolumeGB | order by Day asc'
@@ -260,7 +221,6 @@ jobs:
               Add-Summary 'Log Ingestion' ('peak {0:F2} / avg {1:F2} GB/day' -f $peak, $avg) $status
             }
 
-      # ── STEP 4 — Frontdoor traffic ────────────────────────────────────────
       - task: AzurePowerShell@5
         displayName: 4. Frontdoor traffic
         continueOnError: true
@@ -271,7 +231,6 @@ jobs:
           ScriptType: InlineScript
           Inline: |
             . '$(libps)'
-            # Seeded via seed-sample-logs.sh — mirrors AzureDiagnostics (Category -> Category_s).
             $q = Invoke-Kql 'PreflightAzureDiagnostics_CL
               | where Category =~ "FrontdoorAccessLog"
               | summarize Requests = count() by bin(TimeGenerated, 1d)
@@ -293,7 +252,6 @@ jobs:
               Add-Summary 'Frontdoor Traffic' ('peak ' + $peak + ' requests/day') 'OK'
             }
 
-      # ── STEP 5 — Top traffic tenants ──────────────────────────────────────
       - task: AzurePowerShell@5
         displayName: 5. Top traffic tenants
         continueOnError: true
@@ -304,7 +262,6 @@ jobs:
           ScriptType: InlineScript
           Inline: |
             . '$(libps)'
-            # Seeded via seed-sample-logs.sh — mirrors AzureDiagnostics (Category -> Category_s).
             $q = Invoke-Kql 'PreflightAzureDiagnostics_CL
               | where Category =~ "FrontdoorAccessLog"
               | extend reqUri = tostring(requestUri_s)
@@ -326,7 +283,6 @@ jobs:
               else       { Add-Summary 'Top Traffic Tenants' 'none' 'EMPTY' }
             }
 
-      # ── STEP 6 — IS error count ───────────────────────────────────────────
       - task: AzurePowerShell@5
         displayName: 6. IS error count
         continueOnError: true
@@ -337,8 +293,6 @@ jobs:
           ScriptType: InlineScript
           Inline: |
             . '$(libps)'
-            # Seeded via seed-sample-logs.sh — mirrors ContainerLog + KubePodInventory
-            # (ContainerID -> ContainerID_s, Name -> Name_s, LogEntry -> LogEntry_s).
             $q = Invoke-Kql 'PreflightContainerLog_CL
               | join kind=inner (PreflightKubePodInventory_CL | project ContainerID_s, PodName = Name_s | distinct *) on ContainerID_s
               | project TimeGenerated, LogEntry_s
@@ -365,7 +319,6 @@ jobs:
               Add-Summary 'IS Errors' ('peak ' + $peak + ' errors/day') $status
             }
 
-      # ── STEP 7 — Top error tenants ────────────────────────────────────────
       - task: AzurePowerShell@5
         displayName: 7. Top error tenants
         continueOnError: true
@@ -376,8 +329,6 @@ jobs:
           ScriptType: InlineScript
           Inline: |
             . '$(libps)'
-            # Seeded via seed-sample-logs.sh — mirrors ContainerLog + KubePodInventory
-            # (ContainerID -> ContainerID_s, Name -> Name_s, LogEntry -> LogEntry_s).
             $q = Invoke-Kql 'let paramPodNamePrefix = "wso2is-deployment";
               let errorRegex = ".*iam-cloud-.* : ERROR {.*} .*";
               PreflightContainerLog_CL
@@ -404,7 +355,6 @@ jobs:
               else       { Add-Summary 'Top Error Tenants' 'none' 'EMPTY' }
             }
 
-      # ── STEP 8 — API latency (AzureDiagnostics) ───────────────────────────
       - task: AzurePowerShell@5
         displayName: 8. API latency
         continueOnError: true
@@ -415,7 +365,6 @@ jobs:
           ScriptType: InlineScript
           Inline: |
             . '$(libps)'
-            # Seeded via seed-sample-logs.sh — mirrors AzureDiagnostics (timeTaken_d / requestUri_s unchanged).
             $q = Invoke-Kql 'PreflightAzureDiagnostics_CL
               | where isnotnull(timeTaken_d)
               | summarize AvgSec = round(avg(timeTaken_d), 3) by Endpoint = tostring(requestUri_s)
@@ -437,7 +386,6 @@ jobs:
               Add-Summary 'API Latency' ('worst avg ' + $max + 's') $status
             }
 
-      # ── STEP 9 — SQL DB storage ───────────────────────────────────────────
       - task: AzurePowerShell@5
         displayName: 9. SQL DB storage
         continueOnError: true
@@ -463,8 +411,6 @@ jobs:
                        Where-Object { $_.DatabaseName -ne 'master' }
               foreach ($db in $dbs) {
                 $n++
-                # database_size: currentValue (used) vs limit (max). MaxSizeBytes is the
-                # limit; used bytes come from the 'storage' metric (last non-null point).
                 $maxBytes  = [double]$db.MaxSizeBytes
                 $usedBytes = 0.0
                 try {
@@ -485,7 +431,6 @@ jobs:
               Add-Summary 'SQL Storage' ($n.ToString() + ' db(s) checked') $overall
             }
 
-      # ── STEP 10 — Archival storage size ───────────────────────────────────
       - task: AzurePowerShell@5
         displayName: 10. Archival storage size
         continueOnError: true
@@ -517,7 +462,6 @@ jobs:
             $status = if ($n -eq 0) { 'EMPTY' } else { 'OK' }
             Add-Summary 'Archival Storage' ($n.ToString() + ' account(s)') $status
 
-      # ── STEP 11 — Certificate expiry ──────────────────────────────────────
       - task: AzurePowerShell@5
         displayName: 11. Certificate expiry
         continueOnError: true
@@ -566,10 +510,6 @@ jobs:
               Add-Summary 'Certificates' 'expiry scan' $overall
             }
 
-      # ── STEP 12 — Weekly cost ─────────────────────────────────────────────
-      #   Uses the Az PowerShell Cost Management cmdlet (Invoke-AzCostManagementQuery)
-      #   instead of `az rest` — the service connection wires up the Az context, so
-      #   there is no hand-rolled REST URL/body/JSON-parsing to maintain.
       - task: AzurePowerShell@5
         displayName: 12. Weekly cost
         continueOnError: true
@@ -580,14 +520,13 @@ jobs:
           ScriptType: InlineScript
           Inline: |
             $ErrorActionPreference = 'Stop'
-            . '$(libps)'   # Invoke-Kql/Add-Summary/Add-Note/Format-CsvField/Or-Zero
+            . '$(libps)'
 
             $sub           = '$(subscriptionId)'
             $rg            = '$(resourceGroup)'
             $costCsv       = Join-Path $WorkDir '10_Weekly_Cost.csv'
             $costThreshold = ${{ parameters.costIncreasePercentThreshold }}
 
-            # 10_Weekly_Cost.csv — Cost stays a bare number, matching the jq @csv rows.
             '"Scope","Period","Cost","Note"' | Set-Content -LiteralPath $costCsv
             function Add-CostRow($scope, $period, $cost, $note) {
               $c = 0.0; [double]::TryParse([string]$cost, [ref]$c) | Out-Null
@@ -595,9 +534,6 @@ jobs:
                 Add-Content -LiteralPath $costCsv
             }
 
-            # Get-Cost <scope> <from> <to> -> @{ Out = <double|$null>; Err = '<why empty>' }.
-            # An empty result says WHY it was empty — 403/permission vs "0 rows" (no
-            # billed usage) vs unsupported offer — never a blanket "returned nothing".
             function Get-Cost($scope, [datetime]$from, [datetime]$to) {
               try {
                 $q = Invoke-AzCostManagementQuery -Scope $scope -Type ActualCost -Timeframe Custom `
@@ -616,7 +552,6 @@ jobs:
               }
             }
 
-            # Weekly windows (UTC): this week = last 7 full days, prior = the 7 before.
             $today   = [datetime]::UtcNow.Date
             $cwEnd   = $today.AddDays(-1);  $cwStart = $today.AddDays(-8)
             $pwEnd   = $today.AddDays(-9);  $pwStart = $today.AddDays(-15)
@@ -626,20 +561,16 @@ jobs:
             $subScope = 'subscriptions/' + $sub
             $rgScope  = 'subscriptions/' + $sub + '/resourceGroups/' + $rg
 
-            # ── Subscription scope ──
             $subCw = Get-Cost $subScope $cwStart $cwEnd
             $subPw = Get-Cost $subScope $pwStart $pwEnd
             Add-CostRow 'Subscription' $cwLabel (Or-Zero $subCw.Out) $subCw.Err
             Add-CostRow 'Subscription' $pwLabel (Or-Zero $subPw.Out) $subPw.Err
 
-            # ── Resource-group scope — analysed too, to tell a subscription-level
-            #    permission/scope problem apart from genuine no-data ──
             $rgCw = Get-Cost $rgScope $cwStart $cwEnd
             $rgPw = Get-Cost $rgScope $pwStart $pwEnd
             Add-CostRow ('RG ' + $rg) $cwLabel (Or-Zero $rgCw.Out) $rgCw.Err
             Add-CostRow ('RG ' + $rg) $pwLabel (Or-Zero $rgPw.Out) $rgPw.Err
 
-            # ── Verdict: prefer subscription scope; surface the real reason on empty ──
             if ($null -ne $subCw.Out -or $null -ne $subPw.Out) {
               $c = [double](Or-Zero $subCw.Out); $p = [double](Or-Zero $subPw.Out)
               $status = 'OK'
@@ -662,7 +593,6 @@ jobs:
               Add-Note ('Weekly Cost FAILED — sub scope: ' + $subCw.Err + '; rg scope: ' + $rgCw.Err + ". If both say 403/permission, grant the SP 'Cost Management Reader'.")
             }
 
-      # ── STEP 13 — Secure score (with list fallback) ───────────────────────
       - task: AzurePowerShell@5
         displayName: 13. Secure score
         continueOnError: true
@@ -673,7 +603,6 @@ jobs:
           ScriptType: InlineScript
           Inline: |
             . '$(libps)'
-            # Prefer the overall 'ascScore'; fall back to the first score in the list.
             $pct = $null
             try { $pct = (Get-AzSecuritySecureScore -Name 'ascScore' -ErrorAction Stop).PercentageScore }
             catch {
@@ -691,7 +620,6 @@ jobs:
             }
             $lines | Set-Content -LiteralPath $csvPath
 
-      # ── STEP 14 — AKS pods + nodes ────────────────────────────────────────
       - task: Kubernetes@1
         displayName: 14a. AKS login
         continueOnError: true
@@ -703,10 +631,8 @@ jobs:
           set -uo pipefail
           source "$(lib)"
 
-          # Cluster name from the kubeconfig context set by the Kubernetes@1 login task.
           AKS_NAME=$(kubectl config current-context 2>/dev/null || echo 'unknown')
 
-          # -o wide appends IP ($7) and NODE ($8) to the default pod columns.
           PODS=$(kubectl get pods -A -o wide --no-headers 2>/dev/null || true)
           BAD=$(echo "$PODS" | awk '$4 !~ /^(Running|Completed|Succeeded)$/' || true)
 
@@ -731,37 +657,76 @@ jobs:
         displayName: 14b. AKS pod/node check
         continueOnError: true
 
-      # ── STEP 15 — render CSVs into one multi-sheet .xlsx report ────────────
-      #   Built inline with openpyxl (installed in step 0): one sheet per CSV.
       - bash: |
           set -euo pipefail
           ls "$(workDir)"/*.csv >/dev/null 2>&1 || { echo "No CSVs — nothing to render."; exit 0; }
           mkdir -p "$(reportDir)"
           REPORT="$(reportDir)/preflight-report-$(date -u '+%Y-%m-%d-%H%M').xlsx"
-          python3 - "$(workDir)" "$REPORT" <<'PY'
-          import csv, glob, os, sys
+          python3 - "$(workDir)" "$REPORT" "${{ parameters.lookbackDays }}" "${{ parameters.certExpiryWarningDays }}" "${{ parameters.sqlStorageWarnPercent }}" "${{ parameters.errorCountDailyThreshold }}" "${{ parameters.apiLatencyThresholdSeconds }}" "${{ parameters.costIncreasePercentThreshold }}" <<'PY'
+          import csv, glob, os, sys, re
           import openpyxl
           from openpyxl.styles import Font, PatternFill, Alignment
 
-          workdir, report = sys.argv[1], sys.argv[2]
+          workdir = sys.argv[1]
+          report = sys.argv[2]
+          params = {
+              "Lookback Days": sys.argv[3],
+              "Cert Expiry Warning Days": sys.argv[4],
+              "SQL Storage Warn Percent": sys.argv[5],
+              "Error Count Daily Threshold": sys.argv[6],
+              "API Latency Threshold Seconds": sys.argv[7],
+              "Cost Increase Percent Threshold": sys.argv[8]
+          }
 
           wb = openpyxl.Workbook()
           ws = wb.active
           ws.title = "Preflight Report"
 
-          # Styles
-          SEC_FILL = PatternFill("solid", fgColor="1F4E79")   # dark blue — section title
-          SEC_FONT = Font(bold=True, color="FFFFFF", size=11)
-          HDR_FILL = PatternFill("solid", fgColor="BDD7EE")   # light blue — column headers
-          HDR_FONT = Font(bold=True, color="1F4E79")
-          ALT_FILL = PatternFill("solid", fgColor="F2F2F2")   # light grey — alternate data rows
+          SEC_FILL = PatternFill("solid", fgColor="F47B20")
+          SEC_FONT = Font(bold=True, color="FFFFFF", size=12)
+          HDR_FILL = PatternFill("solid", fgColor="333333")
+          HDR_FONT = Font(bold=True, color="FFFFFF")
+          ALT_FILL = PatternFill("solid", fgColor="F2F2F2")
 
           col_widths = {}
           cur_row = 1
 
+          cell = ws.cell(row=cur_row, column=1, value="Pipeline Parameters")
+          cell.font = SEC_FONT
+          cell.fill = SEC_FILL
+          cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+          ws.merge_cells(start_row=cur_row, start_column=1, end_row=cur_row, end_column=2)
+          ws.row_dimensions[cur_row].height = 20
+          cur_row += 1
+
+          for c, val in enumerate(["Parameter", "Value"], 1):
+              cell = ws.cell(row=cur_row, column=c, value=val)
+              cell.font = HDR_FONT
+              cell.fill = HDR_FILL
+              col_widths[c] = max(col_widths.get(c, 10), len(str(val)) + 2)
+          cur_row += 1
+
+          i = 0
+          for k, v in params.items():
+              cell_k = ws.cell(row=cur_row, column=1, value=k)
+              cell_v = ws.cell(row=cur_row, column=2, value=v)
+              if i % 2 == 1:
+                  cell_k.fill = ALT_FILL
+                  cell_v.fill = ALT_FILL
+              col_widths[1] = max(col_widths.get(1, 10), len(str(k)) + 2)
+              col_widths[2] = max(col_widths.get(2, 10), len(str(v)) + 2)
+              cur_row += 1
+              i += 1
+
+          cur_row += 1
+
+          def fix_name(text):
+              text = re.sub(r"([A-Z]+)([A-Z][a-z])", r'\1 \2', text)
+              text = re.sub(r"([a-z\d])([A-Z])", r'\1 \2', text)
+              return text.replace("_", " ").strip()
+
           for path in sorted(glob.glob(os.path.join(workdir, "*.csv"))):
               stem = os.path.splitext(os.path.basename(path))[0]
-              # "01_Log_Ingestion" -> "Log Ingestion"
               name = stem.split("_", 1)[-1].replace("_", " ") if stem[:2].isdigit() else stem
 
               with open(path, newline="") as f:
@@ -771,26 +736,23 @@ jobs:
 
               ncols = max(len(r) for r in rows)
 
-              # ── Section title: dark blue, merged across all columns ──
               cell = ws.cell(row=cur_row, column=1, value=name)
               cell.font = SEC_FONT
               cell.fill = SEC_FILL
               cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
               if ncols > 1:
-                  ws.merge_cells(start_row=cur_row, start_column=1,
-                                 end_row=cur_row, end_column=ncols)
-              ws.row_dimensions[cur_row].height = 18
+                  ws.merge_cells(start_row=cur_row, start_column=1, end_row=cur_row, end_column=ncols)
+              ws.row_dimensions[cur_row].height = 20
               cur_row += 1
 
-              # ── Column headers: light blue ──
               for c, val in enumerate(rows[0], 1):
-                  cell = ws.cell(row=cur_row, column=c, value=val)
+                  fixed_val = fix_name(val)
+                  cell = ws.cell(row=cur_row, column=c, value=fixed_val)
                   cell.font = HDR_FONT
                   cell.fill = HDR_FILL
-                  col_widths[c] = max(col_widths.get(c, 10), len(str(val)) + 2)
+                  col_widths[c] = max(col_widths.get(c, 10), len(str(fixed_val)) + 2)
               cur_row += 1
 
-              # ── Data rows: alternating white / light grey ──
               for i, data_row in enumerate(rows[1:]):
                   for c, val in enumerate(data_row, 1):
                       cell = ws.cell(row=cur_row, column=c, value=val)
@@ -799,9 +761,8 @@ jobs:
                       col_widths[c] = max(col_widths.get(c, 10), len(str(val)) + 2)
                   cur_row += 1
 
-              cur_row += 1  # blank row between sections
+              cur_row += 1
 
-          # Auto-size columns (capped at 60 chars)
           for col_idx, width in col_widths.items():
               ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = min(width, 60)
 
@@ -812,13 +773,11 @@ jobs:
         displayName: 15. Build .xlsx report
         condition: always()
 
-      # ── STEP 16 — publish the .xlsx report as a pipeline artifact ─────────
       - publish: $(reportDir)
         artifact: preflight-report
         displayName: 16. Publish report artifact
         condition: always()
 
-      # ── STEP 17 — upload the .xlsx report to blob: sa18436/preflight ──────
       - task: AzurePowerShell@5
         displayName: 17. Upload report to blob (sa18436/preflight)
         condition: always()
@@ -847,17 +806,9 @@ jobs:
         env:
           REPORTPATH: $(reportPath)
 
-      # ── STEP 18 — Google Chat: threaded Card V2 "Preflight" run status ────
-      #   Shows only the actual Preflight checks (Auth probe rows excluded),
-      #   grouped into Checked / Needs attention / Skipped, plus a button that
-      #   opens the report's blob container in the Azure portal. Posted into a
-      #   stable thread so weekly runs land under one "Preflight" thread.
       - bash: |
           set -uo pipefail
           [ -z "${GCHAT_WEBHOOK_URL:-}" ] && { echo "No webhook — skipping."; exit 0; }
-          # NOTE: do NOT name this GROUPS — that is a special bash array (the
-          # current user's group IDs) and the assignment gets silently clobbered,
-          # so $GROUPS would expand to a numeric GID and break the jq below.
           CARD_GROUPS=$(python3 - "$(workDir)/00_Summary.csv" <<'PY'
           import csv, sys, json
           g = {"passed": [], "attention": [], "skipped": []}
@@ -866,17 +817,16 @@ jobs:
               for row in r:
                   if len(row) < 3: continue
                   check, res, st = row[0], row[1], row[2]
-                  if check.startswith("Auth:"):   # infra probe, not a preflight check
+                  if check.startswith("Auth:"):
                       continue
                   label = f"{check} — {res}" if res else check
                   if st in ("WARNING", "ALERT", "FAILED"): g["attention"].append(label)
                   elif st in ("SKIP", "EMPTY"):            g["skipped"].append(label)
-                  else:                                     g["passed"].append(label)
+                  else:                                    g["passed"].append(label)
           for k in g: g[k] = g[k][:30]
           print(json.dumps(g))
           PY
           )
-          # Azure portal link to the report's blob container (opens in the tenant/directory).
           BLOB_URL="https://portal.azure.com/#@/resource/subscriptions/$(subscriptionId)/resourceGroups/$(resourceGroup)/providers/Microsoft.Storage/storageAccounts/$(storageAccount)/containersList"
           PAYLOAD=$(jq -n --argjson g "$CARD_GROUPS" \
             --arg ts "$(date -u '+%Y-%m-%d %H:%M UTC')" \
@@ -899,8 +849,6 @@ jobs:
                   {text:"Open blob container",onClick:{openLink:{url:$blob}}}
                 ]}}]}
               ])}}]}')
-          # Bail loudly if the card never built — otherwise we'd POST an empty
-          # body and still print "Posted", masking the real failure.
           [ -z "$PAYLOAD" ] && { echo "##[error]Card payload is empty (jq failed) — not posting."; exit 1; }
           CODE=$(curl -sS -o /tmp/gchat_resp -w '%{http_code}' -H "Content-Type: application/json" -d "$PAYLOAD" "$GCHAT_WEBHOOK_URL")
           if [ "$CODE" = "200" ]; then
