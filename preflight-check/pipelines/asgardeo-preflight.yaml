@@ -14,20 +14,19 @@
 #   5.1 API latency by bucket           FrontdoorLog_CL
 #   6.x AKS pod status + node util      KubePodInventory_CL / NodePerf_CL
 #
-# NOTE: FrontdoorLog_CL / NodePerf_CL are deliberately NOT named
-# AzureDiagnostics_CL / Perf_CL. Those two Log-Type names failed to
-# resolve as custom tables in testing ("Failed to resolve table or
-# column expression") even though other Log-Type names (Usage,
-# ContainerLog, KubePodInventory, AlertLogs) ingested and queried fine.
-# Renaming sidesteps whatever collision/reservation is blocking them.
+# NOTE 1: FrontdoorLog_CL / NodePerf_CL are deliberately NOT named
+# AzureDiagnostics_CL / Perf_CL — those Log-Type names failed to resolve
+# as custom tables in testing.
+#
+# NOTE 2 (column-level reservation): Data Collector API properties named
+# after standard columns (Category, Computer) ingest WITHOUT the _s
+# suffix, so Category_s / Computer_s fail with a SEM0100 semantic error
+# ("The request had some invalid properties" at the outer level). The
+# seed script uses FdCategory / NodeName instead -> FdCategory_s /
+# NodeName_s, and all queries below match.
 #
 # EXCLUDED for now (later enhancements): §9 certificates, §10 database
 # storage / archival sizes.
-#
-# Demo data uses Data Collector API custom tables: table names carry _CL and
-# columns carry type suffixes (_s string, _d number) — e.g. Usage -> Usage_CL,
-# Quantity -> Quantity_d, LogEntry -> LogEntry_s. Seed with
-# seed-preflight-logs.sh before running.
 #
 # Az PowerShell only, results ONLY to Google Chat (secret: GCHAT_WEBHOOK_URL).
 # Card layout: one cardsV2 card per environment, grouped by preflight
@@ -154,13 +153,16 @@ jobs:
               function Get-KqlErrorDetail($ErrorRecord) {
                 # Invoke-AzOperationalInsightsQuery's own exception .Message is
                 # often just "Operation returned an invalid status code
-                # 'BadRequest'" — the real KQL error (bad table/column name,
-                # syntax error) is carried differently depending on SDK version:
+                # 'BadRequest'" — the real KQL error is carried differently
+                # depending on SDK version:
                 #  - Track1 Microsoft.Rest exceptions: .Response.Content (STRING, not HttpContent)
                 #  - Some wrap it as .Body.Error.Message
                 #  - Sometimes PowerShell's own $_.ErrorDetails.Message has the JSON body
-                # Try all of them; if none work, surface the exception type name
-                # so the next run at least tells us which shape we're dealing with.
+                # For SEMANTIC errors (bad table/column names) the outer
+                # error.message is just "The request had some invalid
+                # properties" — the real SEM0100 detail is nested in
+                # error.innererror(.innererror…).message, so we walk to the
+                # deepest innererror.
                 $ex = $ErrorRecord.Exception
                 $candidates = @()
                 try { if ($ex.Body -and $ex.Body.Error -and $ex.Body.Error.Message) { $candidates += [string]$ex.Body.Error.Message } } catch {}
@@ -179,9 +181,16 @@ jobs:
                 foreach ($c in $candidates) {
                   try {
                     $j = $c | ConvertFrom-Json -ErrorAction Stop
-                    if ($j.error.message)                   { return $j.error.message }
-                    if ($j.error.innererror.message)        { return $j.error.innererror.message }
-                    if ($j.message)                         { return $j.message }
+                    # CHANGED: walk to the deepest innererror — that's where
+                    # SEM errors carry the actual table/column detail.
+                    $node = $j.error
+                    $deepest = $null
+                    while ($node) {
+                      if ($node.message) { $deepest = [string]$node.message }
+                      $node = $node.innererror
+                    }
+                    if ($deepest)   { return $deepest }
+                    if ($j.message) { return $j.message }
                   } catch { if ($c.Trim()) { return $c } }
                 }
                 return ('[' + $ex.GetType().FullName + '] ' + $ex.Message)
@@ -335,7 +344,7 @@ jobs:
                 . '$(libps)'
                 $q = Invoke-Kql @'
                 FrontdoorLog_CL
-                | where Category_s =~ "FrontdoorAccessLog"
+                | where FdCategory_s =~ "FrontdoorAccessLog"
                 | summarize Requests = count() by bin(TimeGenerated, 1d)
                 | order by TimeGenerated asc
                 '@
@@ -348,7 +357,7 @@ jobs:
 
                 $h = Invoke-Kql @'
                 FrontdoorLog_CL
-                | where Category_s =~ "FrontdoorAccessLog"
+                | where FdCategory_s =~ "FrontdoorAccessLog"
                 | project ResponseCode = httpStatusCode_s
                 | extend bucket = case(
                     ResponseCode hasprefix "2", "2xx",
@@ -384,7 +393,7 @@ jobs:
                 . '$(libps)'
                 $q = Invoke-Kql @'
                 FrontdoorLog_CL
-                | where Category_s =~ "FrontdoorAccessLog"
+                | where FdCategory_s =~ "FrontdoorAccessLog"
                 | extend reqUri = tostring(requestUri_s)
                 | extend tenant_from_path = extract(@"/t/([^/]+)", 1, reqUri)
                 | extend custom_domain = extract(@"https?://([^/:]+)", 1, reqUri)
@@ -569,20 +578,22 @@ jobs:
                   Add-Summary 'AKS Pods' ('unhealthy: ' + $bad) 'WARNING'
                 } else                    { Add-Summary 'AKS Pods' 'all pods healthy (last 1h)' 'OK' }
 
+                # CHANGED: Computer_s -> NodeName_s (Computer is a reserved
+                # standard column and ingests without the _s suffix).
                 $nodes = Invoke-Kql -Days 1 -Query @'
                 let cpuCap = NodePerf_CL | where ObjectName_s == "K8SNode" and CounterName_s == "cpuCapacityNanoCores"
-                  | summarize Cap = avg(CounterValue_d) by Computer_s;
+                  | summarize Cap = avg(CounterValue_d) by NodeName_s;
                 let cpuUse = NodePerf_CL | where ObjectName_s == "K8SNode" and CounterName_s == "cpuUsageNanoCores"
-                  | summarize Use = avg(CounterValue_d) by Computer_s;
+                  | summarize Use = avg(CounterValue_d) by NodeName_s;
                 let memCap = NodePerf_CL | where ObjectName_s == "K8SNode" and CounterName_s == "memoryCapacityBytes"
-                  | summarize MCap = avg(CounterValue_d) by Computer_s;
+                  | summarize MCap = avg(CounterValue_d) by NodeName_s;
                 let memUse = NodePerf_CL | where ObjectName_s == "K8SNode" and CounterName_s == "memoryRssBytes"
-                  | summarize MUse = avg(CounterValue_d) by Computer_s;
+                  | summarize MUse = avg(CounterValue_d) by NodeName_s;
                 cpuUse
-                | join kind=inner cpuCap on Computer_s
-                | join kind=inner memUse on Computer_s
-                | join kind=inner memCap on Computer_s
-                | project Computer = Computer_s,
+                | join kind=inner cpuCap on NodeName_s
+                | join kind=inner memUse on NodeName_s
+                | join kind=inner memCap on NodeName_s
+                | project Computer = NodeName_s,
                           CpuPct = round(Use  / Cap  * 100, 1),
                           MemPct = round(MUse / MCap * 100, 1)
                 | order by Computer asc
