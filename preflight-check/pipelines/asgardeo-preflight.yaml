@@ -30,6 +30,8 @@
 # seed-preflight-logs.sh before running.
 #
 # Az PowerShell only, results ONLY to Google Chat (secret: GCHAT_WEBHOOK_URL).
+# Card layout: one cardsV2 card per environment, grouped by preflight
+# requirement category, per-item status icons, healthy sections collapsed.
 # ============================================================================
 
 trigger: none
@@ -598,7 +600,8 @@ jobs:
                 }
 
           # ------------------------------------------------------------------
-          # 12. Notify Google Chat — one cardsV2 card per environment
+          # 12. Notify Google Chat — one cardsV2 card per environment,
+          #     grouped by preflight requirement category, per-item status
           # ------------------------------------------------------------------
           - pwsh: |
               $webhook = $env:GCHAT_WEBHOOK_URL
@@ -607,83 +610,116 @@ jobs:
               $summaryPath = '$(workDir)/summary.jsonl'
               if (-not (Test-Path -LiteralPath $summaryPath)) { Write-Host '##[error]No summary file.'; exit 1 }
 
-              # Keep Check and Result as separate fields (not concatenated into one
-              # string) so the card can render them as topLabel/text — this is what
-              # lets Google Chat wrap long lines instead of silently ellipsis-
-              # truncating a single-line decoratedText.text value.
-              $attention = [System.Collections.Generic.List[object]]::new()
-              $passed    = [System.Collections.Generic.List[object]]::new()
-              $skipped   = [System.Collections.Generic.List[object]]::new()
+              # Map each check to its requirement category (FORPIPE section)
+              $categoryMap = [ordered]@{
+                'Access & Prerequisites'     = @('Auth: subscription', 'Auth: Log Analytics')
+                'Data Availability'          = @('Table: Usage_CL','Table: FrontdoorLog_CL','Table: ContainerLog_CL','Table: KubePodInventory_CL','Table: NodePerf_CL','Table: AlertLogs_CL')
+                '1. Log Review & Monitoring' = @('Log Ingestion','Log Existency','Alert Logs Emission')
+                '2. Frontdoor Traffic'       = @('Frontdoor Traffic','Frontdoor HTTP Errors','Top Traffic Tenants')
+                '3. Application Errors'      = @('IS Errors','Top Error Tenants','Long-Running Scripts')
+                '5. API Performance'         = @('API Latency')
+                '6. AKS Health & Capacity'   = @('AKS Pods','AKS Node Utilization')
+              }
+              $statusIcon = @{ OK='check_circle'; WARNING='warning'; FAILED='error'; ALERT='error'; EXPIRED='error'; EMPTY='do_not_disturb_on'; SKIP='do_not_disturb_on' }
+              $attentionStatuses = 'WARNING','ALERT','FAILED','EXPIRED'
 
+              # Parse summary → keyed by check name (last write wins per check)
+              $entries = [ordered]@{}
               foreach ($line in Get-Content -LiteralPath $summaryPath) {
                 if (-not $line.Trim()) { continue }
                 $e = $line | ConvertFrom-Json
-                if ($e.check -like 'Auth:*' -and $e.status -eq 'OK') { continue }
                 $result = [string]$e.result
                 if ($result.Length -gt 600) { $result = $result.Substring(0, 600) + '…' }
-                $item = [pscustomobject]@{ Check = [string]$e.check; Result = $result }
-                switch -Regex ($e.status) {
-                  '^(WARNING|ALERT|FAILED|EXPIRED)$' { $attention.Add($item) }
-                  '^(SKIP|EMPTY)$'                   { $skipped.Add($item) }
-                  default                            { $passed.Add($item) }
-                }
+                $entries[[string]$e.check] = [pscustomobject]@{ Check = [string]$e.check; Result = $result; Status = ([string]$e.status).ToUpper() }
               }
 
-              function New-Section($Title, $Icon, $Items) {
-                if (-not $Items.Count) { return $null }
-                $shown = $Items | Select-Object -First 20
-                $widgets = @($shown | ForEach-Object {
-                  @{ decoratedText = @{
-                       startIcon = @{ materialIcon = @{ name = $Icon } }
-                       topLabel  = $_.Check
-                       text      = if ($_.Result) { $_.Result } else { ' ' }
-                       wrapText  = $true
-                     } }
-                })
-                if ($Items.Count -gt $shown.Count) {
-                  $widgets += @{ decoratedText = @{
-                    startIcon = @{ materialIcon = @{ name = 'more_horiz' } }
-                    text      = ('+' + ($Items.Count - $shown.Count) + ' more — see pipeline logs')
-                    wrapText  = $true
-                  } }
-                }
-                @{ header = ('{0} ({1})' -f $Title, $Items.Count); widgets = $widgets }
+              $nAttention = @($entries.Values | Where-Object { $_.Status -in $attentionStatuses }).Count
+              $nOk        = @($entries.Values | Where-Object { $_.Status -eq 'OK' }).Count
+              $nEmpty     = @($entries.Values | Where-Object { $_.Status -in 'EMPTY','SKIP' }).Count
+
+              function New-ItemWidget($Item) {
+                $icon = $statusIcon[$Item.Status]; if (-not $icon) { $icon = 'help' }
+                @{ decoratedText = @{
+                     startIcon = @{ materialIcon = @{ name = $icon } }
+                     topLabel  = ($Item.Check + '  •  ' + $Item.Status)
+                     text      = if ($Item.Result) { $Item.Result } else { ' ' }
+                     wrapText  = $true
+                   } }
               }
 
-              $runUrl   = '$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)'
-              $sections = @(
-                (New-Section 'Needs attention' 'warning' $attention),
-                (New-Section 'Checked' 'check_circle' $passed),
-                (New-Section 'Skipped / No data' 'do_not_disturb_on' $skipped),
-                @{ widgets = @(@{ buttonList = @{ buttons = @(
-                     @{ text = 'Open pipeline run'; onClick = @{ openLink = @{ url = $runUrl } } }
-                   ) } }) }
-              ) | Where-Object { $_ }
+              $sections = [System.Collections.Generic.List[object]]::new()
 
+              # Environment context — engineers see exactly what this card covers
+              $sections.Add(@{
+                header = 'Environment'
+                collapsible = $true
+                uncollapsibleWidgetsCount = 1
+                widgets = @(
+                  @{ decoratedText = @{ startIcon = @{ materialIcon = @{ name = 'cloud' } }
+                       topLabel = '${{ env.tier }} • ${{ env.region }}'
+                       text = '${{ env.name }}'; wrapText = $true } },
+                  @{ decoratedText = @{ topLabel = 'Subscription'; text = '${{ env.subscriptionId }}'; wrapText = $true } },
+                  @{ decoratedText = @{ topLabel = 'Resource group / Workspace'; text = '${{ env.resourceGroup }} / ${{ env.workspaceId }}'; wrapText = $true } },
+                  @{ decoratedText = @{ topLabel = 'Pod prefix / Lookback'; text = '${{ env.podNamePrefix }} / ${{ parameters.lookbackDays }} day(s)'; wrapText = $true } }
+                )
+              })
+
+              # One section per requirement category, in requirement order.
+              # Sections containing any attention item stay expanded; healthy
+              # sections collapse fully to keep the card short.
+              $seen = [System.Collections.Generic.HashSet[string]]::new()
+              foreach ($cat in $categoryMap.Keys) {
+                $items = @()
+                foreach ($check in $categoryMap[$cat]) {
+                  if ($entries.Contains($check)) { $items += $entries[$check]; [void]$seen.Add($check) }
+                }
+                if (-not $items.Count) { continue }
+                $catAttention = @($items | Where-Object { $_.Status -in $attentionStatuses }).Count
+                $suffix = if ($catAttention) { '  ⚠ ' + $catAttention } else { '  ✓' }
+                $section = @{
+                  header  = ('{0}{1}' -f $cat, $suffix)
+                  widgets = @($items | ForEach-Object { New-ItemWidget $_ })
+                }
+                if (-not $catAttention) {
+                  $section.collapsible = $true
+                  $section.uncollapsibleWidgetsCount = 0
+                }
+                $sections.Add($section)
+              }
+
+              # Anything not mapped (future checks) — never silently dropped
+              $other = @($entries.Values | Where-Object { -not $seen.Contains($_.Check) })
+              if ($other.Count) {
+                $sections.Add(@{ header = 'Other checks'; widgets = @($other | ForEach-Object { New-ItemWidget $_ }) })
+              }
+
+              $runUrl = '$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)'
+              $sections.Add(@{ widgets = @(@{ buttonList = @{ buttons = @(
+                @{ text = 'Open pipeline run'; onClick = @{ openLink = @{ url = $runUrl } } }
+              ) } }) })
+
+              $overall = if ($nAttention) { '⚠ NEEDS ATTENTION' } else { '✅ ALL CLEAR' }
               $card = @{
                 cardsV2 = @(@{
                   cardId = 'preflight-${{ env.name }}'
                   card = @{
                     header = @{
-                      title    = 'Preflight ${{ env.tier }} — ${{ env.name }}'
-                      subtitle = ((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm UTC') +
-                                  '  |  Attention: ' + $attention.Count +
-                                  '  Checked: '      + $passed.Count +
-                                  '  Skipped: '      + $skipped.Count)
+                      title    = 'Weekly Preflight ${{ env.tier }} — ${{ env.name }}'
+                      subtitle = ($overall + '  |  ' +
+                                  (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm UTC') +
+                                  '  |  ⚠ ' + $nAttention + '  ✓ ' + $nOk + '  ∅ ' + $nEmpty)
                     }
                     sections = $sections
                   }
                 })
               }
 
-              $json = $card | ConvertTo-Json -Depth 20 -Compress
+              $json  = $card | ConvertTo-Json -Depth 20 -Compress
               $bytes = [System.Text.Encoding]::UTF8.GetByteCount($json)
-              if ($bytes -gt 45000) {
-                Write-Host "##[warning]Card payload is ${bytes} bytes — Google Chat may reject cards over ~50KB. Trimming further."
-              }
+              if ($bytes -gt 45000) { Write-Host "##[warning]Card payload ${bytes} bytes — near Google Chat's ~50KB limit." }
               try {
                 Invoke-RestMethod -Method Post -Uri $webhook -ContentType 'application/json; charset=UTF-8' -Body $json | Out-Null
-                Write-Host "Posted 'Preflight ${{ env.tier }} — ${{ env.name }}' card to Google Chat ($bytes bytes)."
+                Write-Host "Posted preflight card for '${{ env.name }}' ($bytes bytes)."
               } catch {
                 Write-Host ('##[error]Google Chat POST failed: ' + $_.Exception.Message)
                 exit 1
