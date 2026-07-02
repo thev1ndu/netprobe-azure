@@ -5,14 +5,21 @@
 #   1.1 Log ingestion volume            Usage_CL
 #   1.2 Log existency per deployment    ContainerLog_CL x KubePodInventory_CL
 #   1.3 Alert logs emission             AlertLogs_CL
-#   2.1 Frontdoor daily traffic         AzureDiagnostics_CL
-#   2.4 Frontdoor 4xx/5xx buckets       AzureDiagnostics_CL
-#   2.7 Traffic by tenant               AzureDiagnostics_CL
+#   2.1 Frontdoor daily traffic         FrontdoorLog_CL
+#   2.4 Frontdoor 4xx/5xx buckets       FrontdoorLog_CL
+#   2.7 Traffic by tenant               FrontdoorLog_CL
 #   3.1 IS daily ERROR count            ContainerLog_CL
 #   3.2 Error count by tenant           ContainerLog_CL (full noise filters)
 #   3.5 Long-running script detection   ContainerLog_CL
-#   5.1 API latency by bucket           AzureDiagnostics_CL
-#   6.x AKS pod status + node util      KubePodInventory_CL / Perf_CL
+#   5.1 API latency by bucket           FrontdoorLog_CL
+#   6.x AKS pod status + node util      KubePodInventory_CL / NodePerf_CL
+#
+# NOTE: FrontdoorLog_CL / NodePerf_CL are deliberately NOT named
+# AzureDiagnostics_CL / Perf_CL. Those two Log-Type names failed to
+# resolve as custom tables in testing ("Failed to resolve table or
+# column expression") even though other Log-Type names (Usage,
+# ContainerLog, KubePodInventory, AlertLogs) ingested and queried fine.
+# Renaming sidesteps whatever collision/reservation is blocking them.
 #
 # EXCLUDED for now (later enhancements): §9 certificates, §10 database
 # storage / archival sizes.
@@ -142,6 +149,42 @@ jobs:
                 return $m
               }
 
+              function Get-KqlErrorDetail($ErrorRecord) {
+                # Invoke-AzOperationalInsightsQuery's own exception .Message is
+                # often just "Operation returned an invalid status code
+                # 'BadRequest'" — the real KQL error (bad table/column name,
+                # syntax error) is carried differently depending on SDK version:
+                #  - Track1 Microsoft.Rest exceptions: .Response.Content (STRING, not HttpContent)
+                #  - Some wrap it as .Body.Error.Message
+                #  - Sometimes PowerShell's own $_.ErrorDetails.Message has the JSON body
+                # Try all of them; if none work, surface the exception type name
+                # so the next run at least tells us which shape we're dealing with.
+                $ex = $ErrorRecord.Exception
+                $candidates = @()
+                try { if ($ex.Body -and $ex.Body.Error -and $ex.Body.Error.Message) { $candidates += [string]$ex.Body.Error.Message } } catch {}
+                try {
+                  if ($ex.Response -and $ex.Response.Content) {
+                    $c = $ex.Response.Content
+                    $bodyText = if ($c -is [string]) { $c } else { $c.ReadAsStringAsync().Result }
+                    if ($bodyText) { $candidates += [string]$bodyText }
+                  }
+                } catch {}
+                try { if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) { $candidates += [string]$ErrorRecord.ErrorDetails.Message } } catch {}
+                try {
+                  $inner = $ex.InnerException
+                  if ($inner -and $inner.Message) { $candidates += [string]$inner.Message }
+                } catch {}
+                foreach ($c in $candidates) {
+                  try {
+                    $j = $c | ConvertFrom-Json -ErrorAction Stop
+                    if ($j.error.message)                   { return $j.error.message }
+                    if ($j.error.innererror.message)        { return $j.error.innererror.message }
+                    if ($j.message)                         { return $j.message }
+                  } catch { if ($c.Trim()) { return $c } }
+                }
+                return ('[' + $ex.GetType().FullName + '] ' + $ex.Message)
+              }
+
               function Invoke-Kql([string]$Query, [double]$Days = 0) {
                 if ($Days -le 0) { $Days = $script:Lookback }
                 try {
@@ -149,22 +192,7 @@ jobs:
                          -Query $Query -Timespan (New-TimeSpan -Hours ([int]($Days * 24))) -ErrorAction Stop
                   return @{ Ok = $true; Err = ''; Rows = @($r.Results) }
                 } catch {
-                  # Invoke-AzOperationalInsightsQuery's own .Message is often just
-                  # "Operation returned an invalid status code 'BadRequest'" — the
-                  # real KQL error (bad table/column name, syntax error, etc.) is
-                  # in the HTTP response body. Dig it out when present.
-                  $detail = $null
-                  $resp = $_.Exception.Response
-                  if ($resp -and $resp.Content) {
-                    try {
-                      $body = $resp.Content.ReadAsStringAsync().Result
-                      $j = $body | ConvertFrom-Json -ErrorAction Stop
-                      $detail = $j.error.message
-                      if (-not $detail -and $j.error.innererror) { $detail = $j.error.innererror.message }
-                    } catch { $detail = $body }
-                  }
-                  $msg = if ($detail) { $detail } else { $_.Exception.Message }
-                  return @{ Ok = $false; Err = (Trim-Err $msg); Rows = @() }
+                  return @{ Ok = $false; Err = (Trim-Err (Get-KqlErrorDetail $_) 300); Rows = @() }
                 }
               }
               PSEOF
@@ -193,6 +221,32 @@ jobs:
                 $probe = Invoke-Kql 'print probe=1'
                 if ($probe.Ok) { Add-Summary 'Auth: Log Analytics' 'query API reachable' 'OK' }
                 else           { Add-Summary 'Auth: Log Analytics' $probe.Err 'FAILED' }
+
+          # ------------------------------------------------------------------
+          # 2b. Table existence probe — isolates "table not found / still
+          #     indexing" from real query-logic bugs in the complex checks
+          #     below. Runs a trivial `| count` against every demo table.
+          # ------------------------------------------------------------------
+          - task: AzurePowerShell@5
+            displayName: 2b. Table existence probe
+            continueOnError: true
+            inputs:
+              azureSubscription: ${{ coalesce(env.serviceConnection, parameters.defaultServiceConnection) }}
+              azurePowerShellVersion: LatestVersion
+              pwsh: true
+              ScriptType: InlineScript
+              Inline: |
+                . '$(libps)'
+                foreach ($t in 'Usage_CL','FrontdoorLog_CL','ContainerLog_CL','KubePodInventory_CL','NodePerf_CL','AlertLogs_CL') {
+                  $q = Invoke-Kql ($t + ' | count')
+                  if (-not $q.Ok) {
+                    Add-Summary ('Table: ' + $t) $q.Err 'FAILED'
+                  } else {
+                    $n = if ($q.Rows.Count) { [long]$q.Rows[0].Count } else { 0 }
+                    $status = if ($n -gt 0) { 'OK' } else { 'EMPTY' }
+                    Add-Summary ('Table: ' + $t) ($n.ToString() + ' row(s)') $status
+                  }
+                }
 
           # ------------------------------------------------------------------
           # 3. [1.1] Log ingestion volume
@@ -278,7 +332,7 @@ jobs:
               Inline: |
                 . '$(libps)'
                 $q = Invoke-Kql @'
-                AzureDiagnostics_CL
+                FrontdoorLog_CL
                 | where Category_s =~ "FrontdoorAccessLog"
                 | summarize Requests = count() by bin(TimeGenerated, 1d)
                 | order by TimeGenerated asc
@@ -291,7 +345,7 @@ jobs:
                 }
 
                 $h = Invoke-Kql @'
-                AzureDiagnostics_CL
+                FrontdoorLog_CL
                 | where Category_s =~ "FrontdoorAccessLog"
                 | project ResponseCode = httpStatusCode_s
                 | extend bucket = case(
@@ -327,7 +381,7 @@ jobs:
               Inline: |
                 . '$(libps)'
                 $q = Invoke-Kql @'
-                AzureDiagnostics_CL
+                FrontdoorLog_CL
                 | where Category_s =~ "FrontdoorAccessLog"
                 | extend reqUri = tostring(requestUri_s)
                 | extend tenant_from_path = extract(@"/t/([^/]+)", 1, reqUri)
@@ -465,7 +519,7 @@ jobs:
               Inline: |
                 . '$(libps)'
                 $q = Invoke-Kql @'
-                AzureDiagnostics_CL
+                FrontdoorLog_CL
                 | project TimeGenerated, requestUri_s, timeTaken_d
                 | extend APICall = case(
                     requestUri_s contains "/oauth2/token", "/oauth2/token",
@@ -514,13 +568,13 @@ jobs:
                 } else                    { Add-Summary 'AKS Pods' 'all pods healthy (last 1h)' 'OK' }
 
                 $nodes = Invoke-Kql -Days 1 -Query @'
-                let cpuCap = Perf_CL | where ObjectName_s == "K8SNode" and CounterName_s == "cpuCapacityNanoCores"
+                let cpuCap = NodePerf_CL | where ObjectName_s == "K8SNode" and CounterName_s == "cpuCapacityNanoCores"
                   | summarize Cap = avg(CounterValue_d) by Computer_s;
-                let cpuUse = Perf_CL | where ObjectName_s == "K8SNode" and CounterName_s == "cpuUsageNanoCores"
+                let cpuUse = NodePerf_CL | where ObjectName_s == "K8SNode" and CounterName_s == "cpuUsageNanoCores"
                   | summarize Use = avg(CounterValue_d) by Computer_s;
-                let memCap = Perf_CL | where ObjectName_s == "K8SNode" and CounterName_s == "memoryCapacityBytes"
+                let memCap = NodePerf_CL | where ObjectName_s == "K8SNode" and CounterName_s == "memoryCapacityBytes"
                   | summarize MCap = avg(CounterValue_d) by Computer_s;
-                let memUse = Perf_CL | where ObjectName_s == "K8SNode" and CounterName_s == "memoryRssBytes"
+                let memUse = NodePerf_CL | where ObjectName_s == "K8SNode" and CounterName_s == "memoryRssBytes"
                   | summarize MUse = avg(CounterValue_d) by Computer_s;
                 cpuUse
                 | join kind=inner cpuCap on Computer_s
