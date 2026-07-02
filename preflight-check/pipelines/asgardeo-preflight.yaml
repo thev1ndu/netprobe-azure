@@ -149,7 +149,22 @@ jobs:
                          -Query $Query -Timespan (New-TimeSpan -Hours ([int]($Days * 24))) -ErrorAction Stop
                   return @{ Ok = $true; Err = ''; Rows = @($r.Results) }
                 } catch {
-                  return @{ Ok = $false; Err = (Trim-Err $_.Exception.Message); Rows = @() }
+                  # Invoke-AzOperationalInsightsQuery's own .Message is often just
+                  # "Operation returned an invalid status code 'BadRequest'" — the
+                  # real KQL error (bad table/column name, syntax error, etc.) is
+                  # in the HTTP response body. Dig it out when present.
+                  $detail = $null
+                  $resp = $_.Exception.Response
+                  if ($resp -and $resp.Content) {
+                    try {
+                      $body = $resp.Content.ReadAsStringAsync().Result
+                      $j = $body | ConvertFrom-Json -ErrorAction Stop
+                      $detail = $j.error.message
+                      if (-not $detail -and $j.error.innererror) { $detail = $j.error.innererror.message }
+                    } catch { $detail = $body }
+                  }
+                  $msg = if ($detail) { $detail } else { $_.Exception.Message }
+                  return @{ Ok = $false; Err = (Trim-Err $msg); Rows = @() }
                 }
               }
               PSEOF
@@ -538,31 +553,47 @@ jobs:
               $summaryPath = '$(workDir)/summary.jsonl'
               if (-not (Test-Path -LiteralPath $summaryPath)) { Write-Host '##[error]No summary file.'; exit 1 }
 
-              $attention = [System.Collections.Generic.List[string]]::new()
-              $passed    = [System.Collections.Generic.List[string]]::new()
-              $skipped   = [System.Collections.Generic.List[string]]::new()
+              # Keep Check and Result as separate fields (not concatenated into one
+              # string) so the card can render them as topLabel/text — this is what
+              # lets Google Chat wrap long lines instead of silently ellipsis-
+              # truncating a single-line decoratedText.text value.
+              $attention = [System.Collections.Generic.List[object]]::new()
+              $passed    = [System.Collections.Generic.List[object]]::new()
+              $skipped   = [System.Collections.Generic.List[object]]::new()
 
               foreach ($line in Get-Content -LiteralPath $summaryPath) {
                 if (-not $line.Trim()) { continue }
                 $e = $line | ConvertFrom-Json
                 if ($e.check -like 'Auth:*' -and $e.status -eq 'OK') { continue }
-                $label = if ($e.result) { $e.check + ' — ' + $e.result } else { $e.check }
-                if ($label.Length -gt 400) { $label = $label.Substring(0, 400) + '…' }
+                $result = [string]$e.result
+                if ($result.Length -gt 600) { $result = $result.Substring(0, 600) + '…' }
+                $item = [pscustomobject]@{ Check = [string]$e.check; Result = $result }
                 switch -Regex ($e.status) {
-                  '^(WARNING|ALERT|FAILED|EXPIRED)$' { $attention.Add($label) }
-                  '^(SKIP|EMPTY)$'                   { $skipped.Add($label) }
-                  default                            { $passed.Add($label) }
+                  '^(WARNING|ALERT|FAILED|EXPIRED)$' { $attention.Add($item) }
+                  '^(SKIP|EMPTY)$'                   { $skipped.Add($item) }
+                  default                            { $passed.Add($item) }
                 }
               }
 
               function New-Section($Title, $Icon, $Items) {
                 if (-not $Items.Count) { return $null }
-                @{
-                  header  = ('{0} ({1})' -f $Title, $Items.Count)
-                  widgets = @($Items | Select-Object -First 30 | ForEach-Object {
-                    @{ decoratedText = @{ startIcon = @{ materialIcon = @{ name = $Icon } }; text = $_ } }
-                  })
+                $shown = $Items | Select-Object -First 20
+                $widgets = @($shown | ForEach-Object {
+                  @{ decoratedText = @{
+                       startIcon = @{ materialIcon = @{ name = $Icon } }
+                       topLabel  = $_.Check
+                       text      = if ($_.Result) { $_.Result } else { ' ' }
+                       wrapText  = $true
+                     } }
+                })
+                if ($Items.Count -gt $shown.Count) {
+                  $widgets += @{ decoratedText = @{
+                    startIcon = @{ materialIcon = @{ name = 'more_horiz' } }
+                    text      = ('+' + ($Items.Count - $shown.Count) + ' more — see pipeline logs')
+                    wrapText  = $true
+                  } }
                 }
+                @{ header = ('{0} ({1})' -f $Title, $Items.Count); widgets = $widgets }
               }
 
               $runUrl   = '$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)'
@@ -592,9 +623,13 @@ jobs:
               }
 
               $json = $card | ConvertTo-Json -Depth 20 -Compress
+              $bytes = [System.Text.Encoding]::UTF8.GetByteCount($json)
+              if ($bytes -gt 45000) {
+                Write-Host "##[warning]Card payload is ${bytes} bytes — Google Chat may reject cards over ~50KB. Trimming further."
+              }
               try {
                 Invoke-RestMethod -Method Post -Uri $webhook -ContentType 'application/json; charset=UTF-8' -Body $json | Out-Null
-                Write-Host "Posted 'Preflight ${{ env.tier }} — ${{ env.name }}' card to Google Chat."
+                Write-Host "Posted 'Preflight ${{ env.tier }} — ${{ env.name }}' card to Google Chat ($bytes bytes)."
               } catch {
                 Write-Host ('##[error]Google Chat POST failed: ' + $_.Exception.Message)
                 exit 1
