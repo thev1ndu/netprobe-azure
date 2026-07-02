@@ -1,3 +1,30 @@
+# ============================================================================
+# Weekly Preflight (DEMO) — runs against seeded custom tables in the LAW
+#
+# Checks (from FORPIPE.md), all via Invoke-AzOperationalInsightsQuery:
+#   1.1 Log ingestion volume            Usage_CL
+#   1.2 Log existency per deployment    ContainerLog_CL x KubePodInventory_CL
+#   1.3 Alert logs emission             AlertLogs_CL
+#   2.1 Frontdoor daily traffic         AzureDiagnostics_CL
+#   2.4 Frontdoor 4xx/5xx buckets       AzureDiagnostics_CL
+#   2.7 Traffic by tenant               AzureDiagnostics_CL
+#   3.1 IS daily ERROR count            ContainerLog_CL
+#   3.2 Error count by tenant           ContainerLog_CL (full noise filters)
+#   3.5 Long-running script detection   ContainerLog_CL
+#   5.1 API latency by bucket           AzureDiagnostics_CL
+#   6.x AKS pod status + node util      KubePodInventory_CL / Perf_CL
+#
+# EXCLUDED for now (later enhancements): §9 certificates, §10 database
+# storage / archival sizes.
+#
+# Demo data uses Data Collector API custom tables: table names carry _CL and
+# columns carry type suffixes (_s string, _d number) — e.g. Usage -> Usage_CL,
+# Quantity -> Quantity_d, LogEntry -> LogEntry_s. Seed with
+# seed-preflight-logs.sh before running.
+#
+# Az PowerShell only, results ONLY to Google Chat (secret: GCHAT_WEBHOOK_URL).
+# ============================================================================
+
 trigger: none
 
 schedules:
@@ -9,839 +36,570 @@ schedules:
         - main
 
 parameters:
+  - name: environments
+    type: object
+    default:
+      - name: thevindu-rnd
+        tier: L1
+        region: US
+        serviceConnection: 'thevindu-rnd-sc'
+        subscriptionId: '38785beb-5019-4896-8679-3d41ddacc4b1'
+        resourceGroup: 'rg-thevindu'
+        workspaceId: 'e5d406b5-f761-48a7-9466-9d0d4a768f01'
+        podNamePrefix: 'wso2is'
+
+  - name: defaultServiceConnection
+    type: string
+    default: thevindu-rnd-sc
+  - name: agentPool
+    type: string
+    default: rnd-thevindu-vmss
   - name: lookbackDays
     type: number
     default: 7
-  - name: certExpiryWarningDays
-    type: number
-    default: 30
-  - name: sqlStorageWarnPercent
-    type: number
-    default: 75
   - name: errorCountDailyThreshold
     type: number
     default: 1000
   - name: apiLatencyThresholdSeconds
     type: number
     default: 1.0
-  - name: costIncreasePercentThreshold
+  - name: httpErrorRatePercentThreshold   # (4xx + 5xx) / total
+    type: number
+    default: 5
+  - name: nodeCpuOverProvisionPercent     # avg CPU below this AND mem below next => over-provisioned
     type: number
     default: 25
-  - name: agentPool
-    type: string
-    default: rnd-thevindu-vmss
-
-variables:
-  NODE_NO_WARNINGS: 1
-  AZURE_SERVICE_CONNECTION: thevindu-rnd-sc
-  workDir:              $(Build.ArtifactStagingDirectory)/checks
-  reportDir:            $(Build.ArtifactStagingDirectory)/report
-  warnings:             $(Build.ArtifactStagingDirectory)/warnings.txt
-  lib:                  $(Build.ArtifactStagingDirectory)/lib.sh
-  libps:                $(Build.ArtifactStagingDirectory)/lib.ps1
-  subscriptionId:       '38785beb-5019-4896-8679-3d41ddacc4b1'
-  resourceGroup:        'rg-thevindu'
-  workspaceId:          'e5d406b5-f761-48a7-9466-9d0d4a768f01'
-  keyVaultNames:        'kv-preflight-thevindu'
-  sqlServer:            ''
-  aksServiceConnection: 'rnd-aks-thevindu'
-  storageAccount:       'sa18436'
-  blobContainer:        'preflight'
+  - name: nodeMemOverProvisionPercent
+    type: number
+    default: 50
 
 jobs:
-  - job: RunChecks
-    displayName: Asgardeo pre-flight
-    timeoutInMinutes: 60
-    pool:
-      name: ${{ parameters.agentPool }}
-    steps:
-      - checkout: self
+  - ${{ each env in parameters.environments }}:
+      - job: Preflight_${{ replace(env.name, '-', '_') }}
+        displayName: 'Preflight ${{ env.tier }} — ${{ env.name }}'
+        timeoutInMinutes: 60
+        pool:
+          name: ${{ parameters.agentPool }}
+        variables:
+          workDir: $(Build.ArtifactStagingDirectory)/preflight-${{ env.name }}
+          libps: $(Build.ArtifactStagingDirectory)/preflight-${{ env.name }}/lib.ps1
+        steps:
+          - checkout: none
 
-      - bash: |
-          set -uo pipefail
-          retry() { local n=0; until "$@"; do n=$((n+1)); [ "$n" -ge 4 ] && return 1; echo "retry $n/3: $*"; sleep 10; done; }
+          # ------------------------------------------------------------------
+          # 0. Bootstrap agent: pwsh + Az modules (fresh VMSS agents)
+          # ------------------------------------------------------------------
+          - bash: |
+              set -uo pipefail
+              retry() { local n=0; until "$@"; do n=$((n+1)); [ "$n" -ge 4 ] && return 1; echo "retry $n/3: $*"; sleep 10; done; }
 
-          if ! command -v az >/dev/null 2>&1; then
-            echo "Azure CLI not found — installing…"
-            retry sudo apt-get update -y || true
-            retry sudo apt-get install -y ca-certificates curl apt-transport-https lsb-release gnupg || true
-            retry sudo bash -c 'curl -sL https://aka.ms/InstallAzureCLIDeb | bash' \
-              || retry sudo apt-get install -y azure-cli \
-              || { echo "##[error]Could not install Azure CLI on this agent."; exit 1; }
-          fi
-          command -v jq      >/dev/null 2>&1 || retry sudo bash -c 'apt-get update -y && apt-get install -y jq'      || { echo "##[error]Could not install jq.";      exit 1; }
-          command -v python3 >/dev/null 2>&1 || retry sudo bash -c 'apt-get update -y && apt-get install -y python3' || { echo "##[error]Could not install python3."; exit 1; }
-          python3 -c 'import openpyxl' 2>/dev/null || retry sudo bash -c 'apt-get update -y && apt-get install -y python3-pip' || true
-          python3 -c 'import openpyxl' 2>/dev/null || retry pip3 install --quiet openpyxl || { echo "##[error]Could not install openpyxl."; exit 1; }
+              if ! command -v pwsh >/dev/null 2>&1; then
+                echo "PowerShell (pwsh) not found — installing…"
+                retry sudo bash -c '
+                  set -e
+                  . /etc/os-release
+                  curl -sSL --fail --retry 3 "https://packages.microsoft.com/config/ubuntu/${VERSION_ID}/packages-microsoft-prod.deb" -o /tmp/pmc.deb
+                  dpkg -i /tmp/pmc.deb
+                  apt-get update -y
+                  apt-get install -y powershell
+                ' || retry sudo snap install powershell --classic \
+                  || { echo "##[error]Could not install PowerShell (pwsh)."; exit 1; }
+              fi
 
-          if ! command -v pwsh >/dev/null 2>&1; then
-            echo "PowerShell (pwsh) not found — installing…"
-            retry sudo bash -c '
-              set -e
-              . /etc/os-release
-              curl -sSL "https://packages.microsoft.com/config/ubuntu/${VERSION_ID}/packages-microsoft-prod.deb" -o /tmp/pmc.deb
-              dpkg -i /tmp/pmc.deb
-              apt-get update -y
-              apt-get install -y powershell
-            ' || retry sudo snap install powershell --classic \
-              || { echo "##[error]Could not install PowerShell (pwsh)."; exit 1; }
-          fi
-          retry sudo pwsh -NoProfile -NonInteractive -Command '
-            $ErrorActionPreference = "Stop"
-            Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
-            $mods = "Az.Accounts","Az.OperationalInsights","Az.Monitor","Az.Sql",
-                    "Az.Storage","Az.KeyVault","Az.Security","Az.CostManagement"
-            foreach ($m in $mods) {
-              if (-not (Get-Module -ListAvailable -Name $m)) {
-                Write-Host "Installing $m…"
-                Install-Module $m -Scope AllUsers -Force -AllowClobber -Repository PSGallery
+              retry sudo pwsh -NoProfile -NonInteractive -Command '
+                $ErrorActionPreference = "Stop"
+                Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+                foreach ($m in "Az.Accounts","Az.OperationalInsights") {
+                  if (-not (Get-Module -ListAvailable -Name $m)) {
+                    Write-Host "Installing $m…"
+                    Install-Module $m -Scope AllUsers -Force -AllowClobber -Repository PSGallery
+                  }
+                }
+              ' || { echo "##[error]Could not install Az PowerShell modules."; exit 1; }
+              pwsh --version
+            displayName: 0. Install pwsh + Az modules
+
+          # ------------------------------------------------------------------
+          # 1. Init helpers + per-env state (summary is a JSON-lines file)
+          # ------------------------------------------------------------------
+          - bash: |
+              set -euo pipefail
+              mkdir -p "$(workDir)"
+              : > "$(workDir)/summary.jsonl"
+              cat > "$(libps)" <<'PSEOF'
+              $script:SummaryPath = '$(workDir)/summary.jsonl'
+              $script:WorkspaceId = '${{ env.workspaceId }}'
+              $script:Lookback    = ${{ parameters.lookbackDays }}
+
+              function Add-Summary($Check, $Result, $Status) {
+                @{ check = [string]$Check; result = [string]$Result; status = [string]$Status } |
+                  ConvertTo-Json -Compress | Add-Content -LiteralPath $script:SummaryPath
               }
-            }
-          ' || { echo "##[error]Could not install Az PowerShell modules."; exit 1; }
 
-          echo "Versions:"; az version 2>/dev/null | head -n 20 || true; jq --version; python3 --version; python3 -c 'import openpyxl; print("openpyxl", openpyxl.__version__)'; pwsh --version
-        displayName: 0. Install az + jq + python3 + pwsh
-
-      - bash: |
-          set -euo pipefail
-          mkdir -p "$(workDir)"; : > "$(warnings)"
-          jq -rn '["Check","Result","Status"]|@csv' > "$(workDir)/00_Summary.csv"
-          cat > "$(lib)" <<EOF
-          export WORKDIR="$(workDir)"
-          export WARNINGS="$(warnings)"
-          export SUMMARY="$(workDir)/00_Summary.csv"
-          export WORKSPACE_ID="$(workspaceId)"
-          export LOOKBACK=${{ parameters.lookbackDays }}
-          export AZURE_CORE_ONLY_SHOW_ERRORS=true
-          EOF
-          cat >> "$(lib)" <<'EOF'
-          kql() {
-            local err; err=$(mktemp); QUERY_OK=1; QUERY_ERR=""; QUERY_OUT='[]'
-            if QUERY_OUT=$(az monitor log-analytics query -w "$WORKSPACE_ID" --timespan "P${LOOKBACK}D" --analytics-query "$1" -o json 2>"$err"); then
-              :
-            else
-              QUERY_OK=0; QUERY_ERR=$(grep -vi '^WARNING' "$err" | tr '\n' ' ' | tr '"' "'" | head -c 200); QUERY_OUT='[]'
-            fi
-            rm -f "$err"
-          }
-          summary() { jq -rn --arg c "$1" --arg r "$2" --arg s "$3" '[$c,$r,$s]|@csv' >> "$SUMMARY"; }
-          note()    { echo "$1" >> "$WARNINGS"; }
-          EOF
-          cat > "$(libps)" <<'PSEOF'
-          $script:WorkDir     = '$(workDir)'
-          $script:Warnings    = '$(warnings)'
-          $script:SummaryCsv  = Join-Path '$(workDir)' '00_Summary.csv'
-          $script:WorkspaceId = '$(workspaceId)'
-          $script:Lookback    = ${{ parameters.lookbackDays }}
-
-          function Invoke-Kql([string]$Query) {
-            try {
-              $r = Invoke-AzOperationalInsightsQuery -WorkspaceId $script:WorkspaceId `
-                     -Query $Query -Timespan (New-TimeSpan -Days $script:Lookback) -ErrorAction Stop
-              return @{ Ok = $true; Err = ''; Rows = @($r.Results) }
-            } catch {
-              $m = ($_.Exception.Message -replace '\s+', ' ').Trim()
-              if ($m.Length -gt 200) { $m = $m.Substring(0, 200) }
-              return @{ Ok = $false; Err = $m; Rows = @() }
-            }
-          }
-
-          function Format-CsvField($v) { '"' + ([string]$v -replace '"', '""') + '"' }
-          function Or-Zero($v) { if ($null -ne $v) { $v } else { 0 } }
-
-          function Add-Summary($Check, $Result, $Status) {
-            ('{0},{1},{2}' -f (Format-CsvField $Check), (Format-CsvField $Result), (Format-CsvField $Status)) |
-              Add-Content -LiteralPath $script:SummaryCsv
-          }
-          function Add-Note($Message) { $Message | Add-Content -LiteralPath $script:Warnings }
-          PSEOF
-        displayName: 1. Init outputs + helpers
-
-      - task: AzurePowerShell@5
-        displayName: 2. Verify access (auth probe)
-        continueOnError: true
-        inputs:
-          azureSubscription: $(AZURE_SERVICE_CONNECTION)
-          azurePowerShellVersion: LatestVersion
-          pwsh: true
-          ScriptType: InlineScript
-          Inline: |
-            . '$(libps)'
-            $ctx = Get-AzContext
-            Write-Host ('Service principal context: ' + $ctx.Account.Id + ' / ' + $ctx.Subscription.Name)
-            try {
-              Set-AzContext -Subscription '$(subscriptionId)' -ErrorAction Stop | Out-Null
-              Add-Summary 'Auth: subscription' 'active = $(subscriptionId)' 'OK'
-            } catch {
-              $e = ($_.Exception.Message -replace '\s+', ' ').Trim()
-              if ($e.Length -gt 150) { $e = $e.Substring(0, 150) }
-              Add-Summary 'Auth: subscription' $e 'FAILED'
-              Add-Note 'Cannot set subscription $(subscriptionId) — SP has no access.'
-            }
-            $probe = Invoke-Kql 'print probe=1'
-            if ($probe.Ok) {
-              Add-Summary 'Auth: Log Analytics' 'query API reachable' 'OK'
-            } else {
-              Add-Summary 'Auth: Log Analytics' $probe.Err 'FAILED'
-              Add-Note ("Log Analytics query API FAILED (likely missing 'Log Analytics Reader' on workspace): " + $probe.Err)
-            }
-
-      - task: AzurePowerShell@5
-        displayName: 3. Log ingestion volume
-        continueOnError: true
-        inputs:
-          azureSubscription: $(AZURE_SERVICE_CONNECTION)
-          azurePowerShellVersion: LatestVersion
-          pwsh: true
-          ScriptType: InlineScript
-          Inline: |
-            . '$(libps)'
-            $q = Invoke-Kql 'PreflightUsage_CL
-              | summarize TotalVolumeGB = sum(Quantity_d / 1000.) by bin(TimeGenerated, 1d)
-              | project Day = TimeGenerated, TotalVolumeGB | order by Day asc'
-            $rows = $q.Rows
-            $lines = @('"Day","VolumeGB"')
-            foreach ($r in $rows) {
-              $dayVal = if ($r.Day) { $r.Day } else { $r.TimeGenerated }
-              $day = [string]$dayVal; if ($day.Length -ge 10) { $day = $day.Substring(0, 10) }
-              $lines += (Format-CsvField $day) + ',' + [double]$r.TotalVolumeGB
-            }
-            $lines | Set-Content -LiteralPath (Join-Path $WorkDir '01_Log_Ingestion.csv')
-            if (-not $q.Ok) {
-              Add-Summary 'Log Ingestion' $q.Err 'FAILED'; Add-Note ('Log Ingestion FAILED: ' + $q.Err)
-            } elseif ($rows.Count -eq 0) {
-              Add-Summary 'Log Ingestion' 'query ran, 0 rows' 'EMPTY'
-              Add-Note 'Log Ingestion: 0 rows (no data in window or table empty).'
-            } else {
-              $vals = $rows | ForEach-Object { [double]$_.TotalVolumeGB }
-              $peak = ($vals | Measure-Object -Maximum).Maximum
-              $avg  = ($vals | Measure-Object -Average).Average
-              $status = 'OK'
-              if ($avg -gt 0 -and $peak -gt 2 * $avg) { $status = 'WARNING'; Add-Note 'Log ingestion: peak day >2x average' }
-              Add-Summary 'Log Ingestion' ('peak {0:F2} / avg {1:F2} GB/day' -f $peak, $avg) $status
-            }
-
-      - task: AzurePowerShell@5
-        displayName: 4. Frontdoor traffic
-        continueOnError: true
-        inputs:
-          azureSubscription: $(AZURE_SERVICE_CONNECTION)
-          azurePowerShellVersion: LatestVersion
-          pwsh: true
-          ScriptType: InlineScript
-          Inline: |
-            . '$(libps)'
-            $q = Invoke-Kql 'PreflightAzureDiagnostics_CL
-              | where Category =~ "FrontdoorAccessLog"
-              | summarize Requests = count() by bin(TimeGenerated, 1d)
-              | project Day = TimeGenerated, Requests | order by Day asc'
-            $rows = $q.Rows
-            $lines = @('"Day","Requests"')
-            foreach ($r in $rows) {
-              $dayVal = if ($r.Day) { $r.Day } else { $r.TimeGenerated }
-              $day = [string]$dayVal; if ($day.Length -ge 10) { $day = $day.Substring(0, 10) }
-              $lines += (Format-CsvField $day) + ',' + [long]$r.Requests
-            }
-            $lines | Set-Content -LiteralPath (Join-Path $WorkDir '02_Frontdoor_Traffic.csv')
-            if (-not $q.Ok) {
-              Add-Summary 'Frontdoor Traffic' $q.Err 'FAILED'; Add-Note ('Frontdoor Traffic FAILED: ' + $q.Err)
-            } elseif ($rows.Count -eq 0) {
-              Add-Summary 'Frontdoor Traffic' 'query ran, 0 rows' 'EMPTY'
-            } else {
-              $peak = ($rows | ForEach-Object { [long]$_.Requests } | Measure-Object -Maximum).Maximum
-              Add-Summary 'Frontdoor Traffic' ('peak ' + $peak + ' requests/day') 'OK'
-            }
-
-      - task: AzurePowerShell@5
-        displayName: 5. Top traffic tenants
-        continueOnError: true
-        inputs:
-          azureSubscription: $(AZURE_SERVICE_CONNECTION)
-          azurePowerShellVersion: LatestVersion
-          pwsh: true
-          ScriptType: InlineScript
-          Inline: |
-            . '$(libps)'
-            $q = Invoke-Kql 'PreflightAzureDiagnostics_CL
-              | where Category =~ "FrontdoorAccessLog"
-              | extend reqUri = tostring(requestUri_s)
-              | extend tenant_from_path = extract(@"/t/([^/]+)", 1, reqUri)
-              | extend custom_domain = extract(@"https?://([^/:]+)", 1, reqUri)
-              | extend tenant = case(isnotempty(tenant_from_path), tenant_from_path,
-                  isnotempty(custom_domain) and custom_domain !contains "asgardeo.io", custom_domain, "")
-              | where isnotempty(tenant)
-              | summarize request_count = count() by tenant | top 5 by request_count desc'
-            $rows = $q.Rows
-            $lines = @('"Tenant","RequestCount"')
-            foreach ($r in $rows) { $lines += (Format-CsvField $r.tenant) + ',' + [long]$r.request_count }
-            $lines | Set-Content -LiteralPath (Join-Path $WorkDir '03_Top_Traffic_Tenants.csv')
-            if (-not $q.Ok) {
-              Add-Summary 'Top Traffic Tenants' $q.Err 'FAILED'; Add-Note ('Top Traffic Tenants FAILED: ' + $q.Err)
-            } else {
-              $top = (($rows | Select-Object -First 3) | ForEach-Object { $_.tenant + '=' + $_.request_count }) -join ', '
-              if ($top) { Add-Summary 'Top Traffic Tenants' $top 'OK' }
-              else       { Add-Summary 'Top Traffic Tenants' 'none' 'EMPTY' }
-            }
-
-      - task: AzurePowerShell@5
-        displayName: 6. IS error count
-        continueOnError: true
-        inputs:
-          azureSubscription: $(AZURE_SERVICE_CONNECTION)
-          azurePowerShellVersion: LatestVersion
-          pwsh: true
-          ScriptType: InlineScript
-          Inline: |
-            . '$(libps)'
-            $q = Invoke-Kql 'PreflightContainerLog_CL
-              | join kind=inner (PreflightKubePodInventory_CL | project ContainerID_s, PodName = Name_s | distinct *) on ContainerID_s
-              | project TimeGenerated, LogEntry_s
-              | where LogEntry_s has_cs ": ERROR"
-              | summarize Count = count() by bin(TimeGenerated, 1d)
-              | project Day = TimeGenerated, Count | order by Day asc'
-            $rows = $q.Rows
-            $lines = @('"Day","ErrorCount"')
-            foreach ($r in $rows) {
-              $dayVal = if ($r.Day) { $r.Day } else { $r.TimeGenerated }
-              $day = [string]$dayVal; if ($day.Length -ge 10) { $day = $day.Substring(0, 10) }
-              $lines += (Format-CsvField $day) + ',' + [long]$r.Count
-            }
-            $lines | Set-Content -LiteralPath (Join-Path $WorkDir '04_IS_Errors.csv')
-            $threshold = ${{ parameters.errorCountDailyThreshold }}
-            if (-not $q.Ok) {
-              Add-Summary 'IS Errors' $q.Err 'FAILED'; Add-Note ('IS Errors FAILED: ' + $q.Err)
-            } elseif ($rows.Count -eq 0) {
-              Add-Summary 'IS Errors' 'query ran, 0 rows' 'EMPTY'
-            } else {
-              $peak = ($rows | ForEach-Object { [long]$_.Count } | Measure-Object -Maximum).Maximum
-              $status = 'OK'
-              if ($peak -gt $threshold) { $status = 'WARNING'; Add-Note ('IS errors: peak ' + $peak + '/day exceeded ' + $threshold) }
-              Add-Summary 'IS Errors' ('peak ' + $peak + ' errors/day') $status
-            }
-
-      - task: AzurePowerShell@5
-        displayName: 7. Top error tenants
-        continueOnError: true
-        inputs:
-          azureSubscription: $(AZURE_SERVICE_CONNECTION)
-          azurePowerShellVersion: LatestVersion
-          pwsh: true
-          ScriptType: InlineScript
-          Inline: |
-            . '$(libps)'
-            $q = Invoke-Kql 'let paramPodNamePrefix = "wso2is-deployment";
-              let errorRegex = ".*iam-cloud-.* : ERROR {.*} .*";
-              PreflightContainerLog_CL
-              | join kind=inner (PreflightKubePodInventory_CL | project ContainerID_s, PodName = Name_s
-                  | where PodName contains paramPodNamePrefix | distinct *) on ContainerID_s
-              | where LogEntry_s has_cs "ERROR"
-              | where LogEntry_s matches regex errorRegex
-              | where LogEntry_s !contains "Error when setting claim"
-              | where LogEntry_s !contains "This password has been used in recent history. Please choose a different password"
-              | where LogEntry_s !contains "JSON Web Token is issued before the allowed time."
-              | project TimeGenerated, LogEntry_s
-              | parse LogEntry_s with * "Tenant: [" TenantName "]" *
-              | where isnotempty(TenantName)
-              | summarize LogCount = count() by TenantName | top 5 by LogCount desc'
-            $rows = $q.Rows
-            $lines = @('"TenantName","LogCount"')
-            foreach ($r in $rows) { $lines += (Format-CsvField $r.TenantName) + ',' + [long]$r.LogCount }
-            $lines | Set-Content -LiteralPath (Join-Path $WorkDir '05_Top_Error_Tenants.csv')
-            if (-not $q.Ok) {
-              Add-Summary 'Top Error Tenants' $q.Err 'FAILED'; Add-Note ('Top Error Tenants FAILED: ' + $q.Err)
-            } else {
-              $top = (($rows | Select-Object -First 3) | ForEach-Object { $_.TenantName + '=' + $_.LogCount }) -join ', '
-              if ($top) { Add-Summary 'Top Error Tenants' $top 'OK' }
-              else       { Add-Summary 'Top Error Tenants' 'none' 'EMPTY' }
-            }
-
-      - task: AzurePowerShell@5
-        displayName: 8. API latency
-        continueOnError: true
-        inputs:
-          azureSubscription: $(AZURE_SERVICE_CONNECTION)
-          azurePowerShellVersion: LatestVersion
-          pwsh: true
-          ScriptType: InlineScript
-          Inline: |
-            . '$(libps)'
-            $q = Invoke-Kql 'PreflightAzureDiagnostics_CL
-              | where isnotnull(timeTaken_d)
-              | summarize AvgSec = round(avg(timeTaken_d), 3) by Endpoint = tostring(requestUri_s)
-              | where isnotempty(Endpoint)
-              | top 5 by AvgSec desc'
-            $rows = $q.Rows
-            $lines = @('"Endpoint","AvgSeconds"')
-            foreach ($r in $rows) { $lines += (Format-CsvField $r.Endpoint) + ',' + [double]$r.AvgSec }
-            $lines | Set-Content -LiteralPath (Join-Path $WorkDir '06_API_Latency.csv')
-            $threshold = ${{ parameters.apiLatencyThresholdSeconds }}
-            if (-not $q.Ok) {
-              Add-Summary 'API Latency' $q.Err 'FAILED'; Add-Note ('API Latency FAILED: ' + $q.Err)
-            } elseif ($rows.Count -eq 0) {
-              Add-Summary 'API Latency' 'query ran, 0 rows' 'EMPTY'
-            } else {
-              $max = ($rows | ForEach-Object { [double]$_.AvgSec } | Measure-Object -Maximum).Maximum
-              $status = 'OK'
-              if ($max -gt $threshold) { $status = 'WARNING'; Add-Note ('API latency: worst endpoint ' + $max + 's over ' + $threshold + 's') }
-              Add-Summary 'API Latency' ('worst avg ' + $max + 's') $status
-            }
-
-      - task: AzurePowerShell@5
-        displayName: 9. SQL DB storage
-        continueOnError: true
-        inputs:
-          azureSubscription: $(AZURE_SERVICE_CONNECTION)
-          azurePowerShellVersion: LatestVersion
-          pwsh: true
-          ScriptType: InlineScript
-          Inline: |
-            . '$(libps)'
-            $sqlServer = '$(sqlServer)'
-            $rg        = '$(resourceGroup)'
-            $warnPct   = ${{ parameters.sqlStorageWarnPercent }}
-            $csvPath   = Join-Path $WorkDir '07_SQL_Storage.csv'
-            $lines     = @('"Database","MaxGB","UsedPercent","Status"')
-            if (-not $sqlServer) {
-              $lines += '"(not configured)","","","SKIP"'
-              $lines | Set-Content -LiteralPath $csvPath
-              Add-Summary 'SQL Storage' 'not configured' 'SKIP'
-            } else {
-              $warn = $false; $n = 0
-              $dbs = Get-AzSqlDatabase -ResourceGroupName $rg -ServerName $sqlServer |
-                       Where-Object { $_.DatabaseName -ne 'master' }
-              foreach ($db in $dbs) {
-                $n++
-                $maxBytes  = [double]$db.MaxSizeBytes
-                $usedBytes = 0.0
-                try {
-                  $m = Get-AzMetric -ResourceId $db.ResourceId -MetricName 'storage' -AggregationType Maximum `
-                         -WarningAction SilentlyContinue -ErrorAction Stop
-                  $pts = $m.Data | Where-Object { $null -ne $_.Maximum }
-                  if ($pts) { $usedBytes = [double]$pts[-1].Maximum }
-                } catch {}
-                $gb  = $maxBytes / 1GB
-                $pct = if ($maxBytes -gt 0) { $usedBytes / $maxBytes * 100 } else { 0 }
-                $dbStatus = 'OK'
-                if ($pct -ge $warnPct) { $dbStatus = 'ALERT'; $warn = $true }
-                $lines += (Format-CsvField $db.DatabaseName) + ',' + ('{0:F2}' -f $gb) + ',' + ('{0:F1}' -f $pct) + ',' + (Format-CsvField $dbStatus)
+              function Trim-Err([string]$m, [int]$max = 200) {
+                $m = ($m -replace '\s+', ' ').Trim()
+                if ($m.Length -gt $max) { $m = $m.Substring(0, $max) }
+                return $m
               }
-              $lines | Set-Content -LiteralPath $csvPath
-              if ($warn) { Add-Note ('SQL database(s) over ' + $warnPct + '% storage') }
-              $overall = if ($warn) { 'ALERT' } else { 'OK' }
-              Add-Summary 'SQL Storage' ($n.ToString() + ' db(s) checked') $overall
-            }
 
-      - task: AzurePowerShell@5
-        displayName: 10. Archival storage size
-        continueOnError: true
-        inputs:
-          azureSubscription: $(AZURE_SERVICE_CONNECTION)
-          azurePowerShellVersion: LatestVersion
-          pwsh: true
-          ScriptType: InlineScript
-          Inline: |
-            . '$(libps)'
-            $rg      = '$(resourceGroup)'
-            $csvPath = Join-Path $WorkDir '08_Archival_Storage.csv'
-            $lines   = @('"StorageAccount","GiBUsed"')
-            $start   = [datetime]::UtcNow.AddDays(-2)
-            $n = 0
-            foreach ($sa in Get-AzStorageAccount -ResourceGroupName $rg) {
-              try {
-                $m = Get-AzMetric -ResourceId $sa.Id -MetricName 'UsedCapacity' -AggregationType Average `
-                       -StartTime $start -EndTime ([datetime]::UtcNow) -TimeGrain ([timespan]::FromHours(1)) `
-                       -WarningAction SilentlyContinue -ErrorAction Stop
-                $pts = $m.Data | Where-Object { $null -ne $_.Average }
-                if (-not $pts) { continue }
-                $bytes = [double]$pts[-1].Average
-              } catch { continue }
-              $n++
-              $lines += (Format-CsvField $sa.StorageAccountName) + ',' + ('{0:F2}' -f ($bytes / 1GB))
-            }
-            $lines | Set-Content -LiteralPath $csvPath
-            $status = if ($n -eq 0) { 'EMPTY' } else { 'OK' }
-            Add-Summary 'Archival Storage' ($n.ToString() + ' account(s)') $status
-
-      - task: AzurePowerShell@5
-        displayName: 11. Certificate expiry
-        continueOnError: true
-        inputs:
-          azureSubscription: $(AZURE_SERVICE_CONNECTION)
-          azurePowerShellVersion: LatestVersion
-          pwsh: true
-          ScriptType: InlineScript
-          Inline: |
-            . '$(libps)'
-            $warnDays   = ${{ parameters.certExpiryWarningDays }}
-            $csvPath    = Join-Path $WorkDir '09_Certificates.csv'
-            $lines      = @('"Vault","Certificate","DaysRemaining","Status"')
-            $now        = [datetime]::UtcNow
-            $expiring   = $false
-            $vaultNames = '$(keyVaultNames)' -split ',' |
-                            ForEach-Object { $_.Trim() } | Where-Object { $_ }
-            if (-not $vaultNames) {
-              $lines += '"(not configured)","","","SKIP"'
-              $lines | Set-Content -LiteralPath $csvPath
-              Add-Summary 'Certificates' 'no vaults configured' 'SKIP'
-            } else {
-              foreach ($vName in $vaultNames) {
+              function Invoke-Kql([string]$Query, [double]$Days = 0) {
+                if ($Days -le 0) { $Days = $script:Lookback }
                 try {
-                  $certs = Get-AzKeyVaultCertificate -VaultName $vName -ErrorAction Stop
+                  $r = Invoke-AzOperationalInsightsQuery -WorkspaceId $script:WorkspaceId `
+                         -Query $Query -Timespan (New-TimeSpan -Hours ([int]($Days * 24))) -ErrorAction Stop
+                  return @{ Ok = $true; Err = ''; Rows = @($r.Results) }
                 } catch {
-                  $e = ($_.Exception.Message -replace '\s+', ' ').Trim()
-                  if ($e.Length -gt 150) { $e = $e.Substring(0, 150) }
-                  $lines += (Format-CsvField $vName) + ',"","","FAILED: ' + ($e -replace '"', '') + '"'
-                  Add-Note ('Certificate check: cannot list ' + $vName + ' — ' + $e)
-                  continue
-                }
-                foreach ($c in $certs) {
-                  if (-not $c.Expires) { continue }
-                  $days   = [int][math]::Truncate(($c.Expires.ToUniversalTime() - $now).TotalDays)
-                  $status = if ($days -lt 0) { 'EXPIRED' } elseif ($days -lt $warnDays) { 'EXPIRING' } else { 'OK' }
-                  if ($status -eq 'OK') { continue }
-                  $lines += (Format-CsvField $vName) + ',' + (Format-CsvField $c.Name) + ',' + $days + ',' + (Format-CsvField $status)
-                  Add-Note ('Cert ' + $vName + '/' + $c.Name + ': ' + $status + ' (' + $days + 'd)')
-                  $expiring = $true
+                  return @{ Ok = $false; Err = (Trim-Err $_.Exception.Message); Rows = @() }
                 }
               }
-              $lines | Set-Content -LiteralPath $csvPath
-              $overall = if ($expiring) { 'WARNING' } else { 'OK' }
-              Add-Summary 'Certificates' 'expiry scan' $overall
-            }
+              PSEOF
+              echo "Initialized $(workDir)"
+            displayName: 1. Init helpers
 
-      - task: AzurePowerShell@5
-        displayName: 12. Weekly cost
-        continueOnError: true
-        inputs:
-          azureSubscription: $(AZURE_SERVICE_CONNECTION)
-          azurePowerShellVersion: LatestVersion
-          pwsh: true
-          ScriptType: InlineScript
-          Inline: |
-            $ErrorActionPreference = 'Stop'
-            . '$(libps)'
+          # ------------------------------------------------------------------
+          # 2. Auth probe — subscription + Log Analytics reachability
+          # ------------------------------------------------------------------
+          - task: AzurePowerShell@5
+            displayName: 2. Verify access
+            continueOnError: true
+            inputs:
+              azureSubscription: ${{ coalesce(env.serviceConnection, parameters.defaultServiceConnection) }}
+              azurePowerShellVersion: LatestVersion
+              pwsh: true
+              ScriptType: InlineScript
+              Inline: |
+                . '$(libps)'
+                try {
+                  Set-AzContext -Subscription '${{ env.subscriptionId }}' -ErrorAction Stop | Out-Null
+                  Add-Summary 'Auth: subscription' 'active = ${{ env.subscriptionId }}' 'OK'
+                } catch {
+                  Add-Summary 'Auth: subscription' (Trim-Err $_.Exception.Message 150) 'FAILED'
+                }
+                $probe = Invoke-Kql 'print probe=1'
+                if ($probe.Ok) { Add-Summary 'Auth: Log Analytics' 'query API reachable' 'OK' }
+                else           { Add-Summary 'Auth: Log Analytics' $probe.Err 'FAILED' }
 
-            $sub           = '$(subscriptionId)'
-            $rg            = '$(resourceGroup)'
-            $costCsv       = Join-Path $WorkDir '10_Weekly_Cost.csv'
-            $costThreshold = ${{ parameters.costIncreasePercentThreshold }}
+          # ------------------------------------------------------------------
+          # 3. [1.1] Log ingestion volume
+          # ------------------------------------------------------------------
+          - task: AzurePowerShell@5
+            displayName: 3. Log ingestion volume
+            continueOnError: true
+            inputs:
+              azureSubscription: ${{ coalesce(env.serviceConnection, parameters.defaultServiceConnection) }}
+              azurePowerShellVersion: LatestVersion
+              pwsh: true
+              ScriptType: InlineScript
+              Inline: |
+                . '$(libps)'
+                $q = Invoke-Kql @'
+                Usage_CL
+                | summarize TotalVolumeGB = sum(Quantity_d / 1000.) by bin(TimeGenerated, 1d)
+                | project Day = TimeGenerated, TotalVolumeGB
+                | order by Day asc
+                '@
+                if (-not $q.Ok)          { Add-Summary 'Log Ingestion' $q.Err 'FAILED'; return }
+                if (!$q.Rows.Count)      { Add-Summary 'Log Ingestion' 'query ran, 0 rows' 'EMPTY'; return }
+                $vals = $q.Rows | ForEach-Object { [double]$_.TotalVolumeGB }
+                $peak = ($vals | Measure-Object -Maximum).Maximum
+                $avg  = ($vals | Measure-Object -Average).Average
+                $status = if ($avg -gt 0 -and $peak -gt 2 * $avg) { 'WARNING' } else { 'OK' }
+                Add-Summary 'Log Ingestion' ('peak {0:F2} / avg {1:F2} GB/day' -f $peak, $avg) $status
 
-            function Get-Cost($scope, [datetime]$from, [datetime]$to) {
+          # ------------------------------------------------------------------
+          # 4. [1.2] Log existency per deployment + [1.3] alert logs emission
+          # ------------------------------------------------------------------
+          - task: AzurePowerShell@5
+            displayName: 4. Log existency + alert logs
+            continueOnError: true
+            inputs:
+              azureSubscription: ${{ coalesce(env.serviceConnection, parameters.defaultServiceConnection) }}
+              azurePowerShellVersion: LatestVersion
+              pwsh: true
+              ScriptType: InlineScript
+              Inline: |
+                . '$(libps)'
+                $q = Invoke-Kql @'
+                let paramPodNamePrefix = "${{ env.podNamePrefix }}";
+                ContainerLog_CL
+                | join kind = inner (KubePodInventory_CL
+                    | project ContainerID_s, PodName = Name_s
+                    | where PodName contains paramPodNamePrefix
+                    | distinct *) on ContainerID_s
+                | project TimeGenerated, deployment = strcat_array(array_slice(split(PodName, "-"), 0, -3), "-")
+                | summarize LogCount = count() by deployment
+                | order by deployment asc
+                '@
+                if (-not $q.Ok)     { Add-Summary 'Log Existency' $q.Err 'FAILED' }
+                elseif (!$q.Rows.Count) {
+                  Add-Summary 'Log Existency' 'no logs from any "${{ env.podNamePrefix }}" deployment' 'WARNING'
+                } else {
+                  $d = ($q.Rows | ForEach-Object { $_.deployment + '=' + $_.LogCount }) -join ', '
+                  Add-Summary 'Log Existency' $d 'OK'
+                }
+
+                $a = Invoke-Kql @'
+                AlertLogs_CL
+                | summarize AggregatedValue = count() by bin(TimeGenerated, 1d)
+                '@
+                if (-not $a.Ok)          { Add-Summary 'Alert Logs Emission' $a.Err 'FAILED' }
+                elseif (!$a.Rows.Count)  { Add-Summary 'Alert Logs Emission' 'no alert logs emitted in window' 'WARNING' }
+                else {
+                  $total = ($a.Rows | ForEach-Object { [long]$_.AggregatedValue } | Measure-Object -Sum).Sum
+                  Add-Summary 'Alert Logs Emission' ($total.ToString() + ' alert log(s) in window') 'OK'
+                }
+
+          # ------------------------------------------------------------------
+          # 5. [2.1] Frontdoor daily traffic + [2.4] 4xx/5xx buckets
+          # ------------------------------------------------------------------
+          - task: AzurePowerShell@5
+            displayName: 5. Frontdoor traffic + HTTP errors
+            continueOnError: true
+            inputs:
+              azureSubscription: ${{ coalesce(env.serviceConnection, parameters.defaultServiceConnection) }}
+              azurePowerShellVersion: LatestVersion
+              pwsh: true
+              ScriptType: InlineScript
+              Inline: |
+                . '$(libps)'
+                $q = Invoke-Kql @'
+                AzureDiagnostics_CL
+                | where Category_s =~ "FrontdoorAccessLog"
+                | summarize Requests = count() by bin(TimeGenerated, 1d)
+                | order by TimeGenerated asc
+                '@
+                if (-not $q.Ok)          { Add-Summary 'Frontdoor Traffic' $q.Err 'FAILED' }
+                elseif (!$q.Rows.Count)  { Add-Summary 'Frontdoor Traffic' 'query ran, 0 rows' 'EMPTY' }
+                else {
+                  $peak = ($q.Rows | ForEach-Object { [long]$_.Requests } | Measure-Object -Maximum).Maximum
+                  Add-Summary 'Frontdoor Traffic' ('peak ' + $peak + ' requests/day') 'OK'
+                }
+
+                $h = Invoke-Kql @'
+                AzureDiagnostics_CL
+                | where Category_s =~ "FrontdoorAccessLog"
+                | project ResponseCode = httpStatusCode_s
+                | extend bucket = case(
+                    ResponseCode hasprefix "2", "2xx",
+                    ResponseCode hasprefix "3", "3xx",
+                    ResponseCode hasprefix "4", "4xx",
+                    ResponseCode hasprefix "5", "5xx",
+                    "other")
+                | summarize Count = count() by bucket
+                '@
+                if (-not $h.Ok)          { Add-Summary 'Frontdoor HTTP Errors' $h.Err 'FAILED'; return }
+                if (!$h.Rows.Count)      { Add-Summary 'Frontdoor HTTP Errors' 'query ran, 0 rows' 'EMPTY'; return }
+                $total = ($h.Rows | ForEach-Object { [long]$_.Count } | Measure-Object -Sum).Sum
+                $bad   = ($h.Rows | Where-Object { $_.bucket -in '4xx', '5xx' } |
+                            ForEach-Object { [long]$_.Count } | Measure-Object -Sum).Sum
+                $bad   = if ($null -ne $bad) { $bad } else { 0 }
+                $rate  = if ($total -gt 0) { [math]::Round($bad / $total * 100, 2) } else { 0 }
+                $detail = (($h.Rows | Sort-Object bucket | ForEach-Object { $_.bucket + '=' + $_.Count }) -join ', ') + ' (' + $rate + '% 4xx/5xx)'
+                $status = if ($rate -gt ${{ parameters.httpErrorRatePercentThreshold }}) { 'WARNING' } else { 'OK' }
+                Add-Summary 'Frontdoor HTTP Errors' $detail $status
+
+          # ------------------------------------------------------------------
+          # 6. [2.7] Traffic by tenant
+          # ------------------------------------------------------------------
+          - task: AzurePowerShell@5
+            displayName: 6. Traffic by tenant
+            continueOnError: true
+            inputs:
+              azureSubscription: ${{ coalesce(env.serviceConnection, parameters.defaultServiceConnection) }}
+              azurePowerShellVersion: LatestVersion
+              pwsh: true
+              ScriptType: InlineScript
+              Inline: |
+                . '$(libps)'
+                $q = Invoke-Kql @'
+                AzureDiagnostics_CL
+                | where Category_s =~ "FrontdoorAccessLog"
+                | extend reqUri = tostring(requestUri_s)
+                | extend tenant_from_path = extract(@"/t/([^/]+)", 1, reqUri)
+                | extend custom_domain = extract(@"https?://([^/:]+)", 1, reqUri)
+                | extend tenant = case(
+                    isnotempty(tenant_from_path), tenant_from_path,
+                    isnotempty(custom_domain) and custom_domain !contains "asgardeo.io", custom_domain,
+                    "")
+                | where isnotempty(tenant)
+                | summarize request_count = count() by tenant
+                | top 5 by request_count desc
+                '@
+                if (-not $q.Ok) { Add-Summary 'Top Traffic Tenants' $q.Err 'FAILED'; return }
+                $top = (($q.Rows | Select-Object -First 5) | ForEach-Object { $_.tenant + '=' + $_.request_count }) -join ', '
+                if ($top) { Add-Summary 'Top Traffic Tenants' $top 'OK' }
+                else      { Add-Summary 'Top Traffic Tenants' 'none' 'EMPTY' }
+
+          # ------------------------------------------------------------------
+          # 7. [3.1] IS daily ERROR count
+          # ------------------------------------------------------------------
+          - task: AzurePowerShell@5
+            displayName: 7. IS error count
+            continueOnError: true
+            inputs:
+              azureSubscription: ${{ coalesce(env.serviceConnection, parameters.defaultServiceConnection) }}
+              azurePowerShellVersion: LatestVersion
+              pwsh: true
+              ScriptType: InlineScript
+              Inline: |
+                . '$(libps)'
+                $q = Invoke-Kql @'
+                let errorType = ": ERROR";
+                ContainerLog_CL
+                | join kind = inner (KubePodInventory_CL
+                    | project ContainerID_s, PodName = Name_s
+                    | distinct *) on ContainerID_s
+                | project TimeGenerated, PodName, LogEntry_s
+                | where LogEntry_s has_cs errorType
+                | summarize Count = count() by bin(TimeGenerated, 1d)
+                | order by TimeGenerated asc
+                '@
+                $threshold = ${{ parameters.errorCountDailyThreshold }}
+                if (-not $q.Ok)     { Add-Summary 'IS Errors' $q.Err 'FAILED'; return }
+                if (!$q.Rows.Count) { Add-Summary 'IS Errors' 'query ran, 0 rows' 'EMPTY'; return }
+                $peak = ($q.Rows | ForEach-Object { [long]$_.Count } | Measure-Object -Maximum).Maximum
+                $status = if ($peak -gt $threshold) { 'WARNING' } else { 'OK' }
+                Add-Summary 'IS Errors' ('peak ' + $peak + ' errors/day (threshold ' + $threshold + ')') $status
+
+          # ------------------------------------------------------------------
+          # 8. [3.2] Error count by tenant (full production noise filters)
+          # ------------------------------------------------------------------
+          - task: AzurePowerShell@5
+            displayName: 8. Top error tenants
+            continueOnError: true
+            inputs:
+              azureSubscription: ${{ coalesce(env.serviceConnection, parameters.defaultServiceConnection) }}
+              azurePowerShellVersion: LatestVersion
+              pwsh: true
+              ScriptType: InlineScript
+              Inline: |
+                . '$(libps)'
+                $q = Invoke-Kql @'
+                let paramPodNamePrefix = "${{ env.podNamePrefix }}";
+                let errorType = "ERROR";
+                let errorRegex = ".*iam-cloud-.* : ERROR {.*} .*";
+                ContainerLog_CL
+                | join kind = inner (KubePodInventory_CL
+                    | project ContainerID_s, PodName = Name_s
+                    | where PodName contains paramPodNamePrefix
+                    | distinct *) on ContainerID_s
+                | where LogEntry_s has_cs errorType
+                | where LogEntry_s matches regex errorRegex
+                | where LogEntry_s !contains "Error when setting claim"
+                | where LogEntry_s !contains "No message body reader has been found for class java.lang.String, ContentType: application/octet-stream"
+                | where LogEntry_s !contains "Error occurred while getting database type from DB connection org.wso2.carbon.user.core.UserStoreException: Error occurred while getting database type from DB connection"
+                | where LogEntry_s !contains "Error occurred while getting database type from DB connection org.wso2.charon3.core.exceptions.CharonException: Error occurred while getting database type from DB connection"
+                | where LogEntry_s !contains "This password has been used in recent history. Please choose a different password"
+                | where LogEntry_s !contains "Error occurred while getting the OAuth App tenantDomain by Consumer key: CHOREO_SYSTEM_APP_MANAGER"
+                | where LogEntry_s !contains "ERROR {org.wso2.carbon.identity.oauth2.grant.jwt.JWTBearerGrantHandler} - JSON Web Token is issued before the allowed time."
+                | where LogEntry_s !contains "ERROR {org.wso2.carbon.identity.input.validation.mgt.listener.InputValidationListener} - Failed to validate username for user."
+                | where LogEntry_s !contains "Caused by: java.sql.BatchUpdateException: Violation of UNIQUE KEY constraint 'UQ__UM_USER___BBB8EC7E9AE1457C'. Cannot insert duplicate key in object 'dbo.UM_USER_ROLE'."
+                | where LogEntry_s !contains "{org.wso2.carbon.identity.application.authentication.framework.config.model.graph.openjdk.nashorn.JsOpenJdkNashornGraphBuilder} - Event handler : authenticationOptions is not a function"
+                | where LogEntry_s !contains "{org.wso2.carbon.identity.application.authentication.framework.config.model.graph.js.JsClaims} - Error when getting claim : http://wso2.org/claims/identity/country of user"
+                | where not (LogEntry_s matches regex @"Tenant:\s*\[lilt\].*?iam-cloud-carbon\s*:\s*ERROR\s*\{org.wso2.carbon.identity.application.authentication.framework.config.model.graph.js.JsLogger\}")
+                | project TimeGenerated, LogEntry_s
+                | parse LogEntry_s with * "Tenant: [" TenantName "]" *
+                | where isnotempty(TenantName)
+                | summarize LogCount = count() by TenantName
+                | top 5 by LogCount desc
+                '@
+                if (-not $q.Ok) { Add-Summary 'Top Error Tenants' $q.Err 'FAILED'; return }
+                $top = (($q.Rows | Select-Object -First 5) | ForEach-Object { $_.TenantName + '=' + $_.LogCount }) -join ', '
+                if ($top) { Add-Summary 'Top Error Tenants' $top 'OK' }
+                else      { Add-Summary 'Top Error Tenants' 'none' 'EMPTY' }
+
+          # ------------------------------------------------------------------
+          # 9. [3.5] Long-running script detection
+          # ------------------------------------------------------------------
+          - task: AzurePowerShell@5
+            displayName: 9. Long-running scripts
+            continueOnError: true
+            inputs:
+              azureSubscription: ${{ coalesce(env.serviceConnection, parameters.defaultServiceConnection) }}
+              azurePowerShellVersion: LatestVersion
+              pwsh: true
+              ScriptType: InlineScript
+              Inline: |
+                . '$(libps)'
+                $q = Invoke-Kql @'
+                ContainerLog_CL
+                | join kind = inner (KubePodInventory_CL
+                    | project ContainerID_s, PodName = Name_s
+                    | where PodName hasprefix "${{ env.podNamePrefix }}"
+                    | distinct *) on ContainerID_s
+                | where LogEntry_s has "The script took too much time to execute"
+                | project TimeGenerated, deployment = strcat_array(array_slice(split(PodName, "-"), 0, -3), "-")
+                | summarize Count = count() by deployment
+                '@
+                if (-not $q.Ok)     { Add-Summary 'Long-Running Scripts' $q.Err 'FAILED'; return }
+                if (!$q.Rows.Count) { Add-Summary 'Long-Running Scripts' 'none detected' 'OK'; return }
+                $d = ($q.Rows | ForEach-Object { $_.deployment + '=' + $_.Count }) -join ', '
+                Add-Summary 'Long-Running Scripts' $d 'WARNING'
+
+          # ------------------------------------------------------------------
+          # 10. [5.1] API latency by API call bucket
+          # ------------------------------------------------------------------
+          - task: AzurePowerShell@5
+            displayName: 10. API latency
+            continueOnError: true
+            inputs:
+              azureSubscription: ${{ coalesce(env.serviceConnection, parameters.defaultServiceConnection) }}
+              azurePowerShellVersion: LatestVersion
+              pwsh: true
+              ScriptType: InlineScript
+              Inline: |
+                . '$(libps)'
+                $q = Invoke-Kql @'
+                AzureDiagnostics_CL
+                | project TimeGenerated, requestUri_s, timeTaken_d
+                | extend APICall = case(
+                    requestUri_s contains "/oauth2/token", "/oauth2/token",
+                    requestUri_s contains "/oauth2/introspection", "/oauth2/introspection",
+                    requestUri_s contains "/commonauth", "/commonauth",
+                    requestUri_s contains "/authorize", "/authorize",
+                    requestUri_s contains "/scim2", "/scim2",
+                    requestUri_s contains "/api", "/api",
+                    "Other")
+                | where APICall != "Other"
+                | summarize AvgLatency = round(avg(todouble(timeTaken_d)), 3) by APICall
+                | order by AvgLatency desc
+                '@
+                $threshold = ${{ parameters.apiLatencyThresholdSeconds }}
+                if (-not $q.Ok)     { Add-Summary 'API Latency' $q.Err 'FAILED'; return }
+                if (!$q.Rows.Count) { Add-Summary 'API Latency' 'query ran, 0 rows' 'EMPTY'; return }
+                $detail = ($q.Rows | ForEach-Object { $_.APICall + '=' + $_.AvgLatency + 's' }) -join ', '
+                $worst  = [double]$q.Rows[0].AvgLatency
+                $status = if ($worst -gt $threshold) { 'WARNING' } else { 'OK' }
+                Add-Summary 'API Latency' $detail $status
+
+          # ------------------------------------------------------------------
+          # 11. [6.x] AKS pod status + node utilization / over-provisioning
+          # ------------------------------------------------------------------
+          - task: AzurePowerShell@5
+            displayName: 11. AKS pods + node metrics
+            continueOnError: true
+            inputs:
+              azureSubscription: ${{ coalesce(env.serviceConnection, parameters.defaultServiceConnection) }}
+              azurePowerShellVersion: LatestVersion
+              pwsh: true
+              ScriptType: InlineScript
+              Inline: |
+                . '$(libps)'
+                $pods = Invoke-Kql -Days 0.05 -Query @'
+                KubePodInventory_CL
+                | where TimeGenerated > ago(1h)
+                | summarize arg_max(TimeGenerated, PodStatus_s, Namespace_s) by Name_s
+                | where PodStatus_s !in ("Running", "Succeeded", "Completed")
+                | project Namespace = Namespace_s, Name = Name_s, PodStatus = PodStatus_s
+                '@
+                if (-not $pods.Ok)        { Add-Summary 'AKS Pods' $pods.Err 'FAILED' }
+                elseif ($pods.Rows.Count) {
+                  $bad = ($pods.Rows | Select-Object -First 10 | ForEach-Object { $_.Namespace + '/' + $_.Name + '=' + $_.PodStatus }) -join ', '
+                  Add-Summary 'AKS Pods' ('unhealthy: ' + $bad) 'WARNING'
+                } else                    { Add-Summary 'AKS Pods' 'all pods healthy (last 1h)' 'OK' }
+
+                $nodes = Invoke-Kql -Days 1 -Query @'
+                let cpuCap = Perf_CL | where ObjectName_s == "K8SNode" and CounterName_s == "cpuCapacityNanoCores"
+                  | summarize Cap = avg(CounterValue_d) by Computer_s;
+                let cpuUse = Perf_CL | where ObjectName_s == "K8SNode" and CounterName_s == "cpuUsageNanoCores"
+                  | summarize Use = avg(CounterValue_d) by Computer_s;
+                let memCap = Perf_CL | where ObjectName_s == "K8SNode" and CounterName_s == "memoryCapacityBytes"
+                  | summarize MCap = avg(CounterValue_d) by Computer_s;
+                let memUse = Perf_CL | where ObjectName_s == "K8SNode" and CounterName_s == "memoryRssBytes"
+                  | summarize MUse = avg(CounterValue_d) by Computer_s;
+                cpuUse
+                | join kind=inner cpuCap on Computer_s
+                | join kind=inner memUse on Computer_s
+                | join kind=inner memCap on Computer_s
+                | project Computer = Computer_s,
+                          CpuPct = round(Use  / Cap  * 100, 1),
+                          MemPct = round(MUse / MCap * 100, 1)
+                | order by Computer asc
+                '@
+                if (-not $nodes.Ok)     { Add-Summary 'AKS Node Utilization' $nodes.Err 'FAILED'; return }
+                if (!$nodes.Rows.Count) { Add-Summary 'AKS Node Utilization' 'no node perf data' 'EMPTY'; return }
+                $avgCpu = [math]::Round(($nodes.Rows | ForEach-Object { [double]$_.CpuPct } | Measure-Object -Average).Average, 1)
+                $avgMem = [math]::Round(($nodes.Rows | ForEach-Object { [double]$_.MemPct } | Measure-Object -Average).Average, 1)
+                $n      = $nodes.Rows.Count
+                $result = $n.ToString() + ' node(s): avg CPU ' + $avgCpu + '%, mem ' + $avgMem + '%'
+                if ($avgCpu -lt ${{ parameters.nodeCpuOverProvisionPercent }} -and $avgMem -lt ${{ parameters.nodeMemOverProvisionPercent }}) {
+                  Add-Summary 'AKS Node Utilization' ($result + ' — possibly over-provisioned, consider scaling down') 'WARNING'
+                } else {
+                  Add-Summary 'AKS Node Utilization' $result 'OK'
+                }
+
+          # ------------------------------------------------------------------
+          # 12. Notify Google Chat — one cardsV2 card per environment
+          # ------------------------------------------------------------------
+          - pwsh: |
+              $webhook = $env:GCHAT_WEBHOOK_URL
+              if (-not $webhook) { Write-Host 'No GCHAT_WEBHOOK_URL — skipping.'; exit 0 }
+
+              $summaryPath = '$(workDir)/summary.jsonl'
+              if (-not (Test-Path -LiteralPath $summaryPath)) { Write-Host '##[error]No summary file.'; exit 1 }
+
+              $attention = [System.Collections.Generic.List[string]]::new()
+              $passed    = [System.Collections.Generic.List[string]]::new()
+              $skipped   = [System.Collections.Generic.List[string]]::new()
+
+              foreach ($line in Get-Content -LiteralPath $summaryPath) {
+                if (-not $line.Trim()) { continue }
+                $e = $line | ConvertFrom-Json
+                if ($e.check -like 'Auth:*' -and $e.status -eq 'OK') { continue }
+                $label = if ($e.result) { $e.check + ' — ' + $e.result } else { $e.check }
+                if ($label.Length -gt 400) { $label = $label.Substring(0, 400) + '…' }
+                switch -Regex ($e.status) {
+                  '^(WARNING|ALERT|FAILED|EXPIRED)$' { $attention.Add($label) }
+                  '^(SKIP|EMPTY)$'                   { $skipped.Add($label) }
+                  default                            { $passed.Add($label) }
+                }
+              }
+
+              function New-Section($Title, $Icon, $Items) {
+                if (-not $Items.Count) { return $null }
+                @{
+                  header  = ('{0} ({1})' -f $Title, $Items.Count)
+                  widgets = @($Items | Select-Object -First 30 | ForEach-Object {
+                    @{ decoratedText = @{ startIcon = @{ materialIcon = @{ name = $Icon } }; text = $_ } }
+                  })
+                }
+              }
+
+              $runUrl   = '$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)'
+              $sections = @(
+                (New-Section 'Needs attention' 'warning' $attention),
+                (New-Section 'Checked' 'check_circle' $passed),
+                (New-Section 'Skipped / No data' 'do_not_disturb_on' $skipped),
+                @{ widgets = @(@{ buttonList = @{ buttons = @(
+                     @{ text = 'Open pipeline run'; onClick = @{ openLink = @{ url = $runUrl } } }
+                   ) } }) }
+              ) | Where-Object { $_ }
+
+              $card = @{
+                cardsV2 = @(@{
+                  cardId = 'preflight-${{ env.name }}'
+                  card = @{
+                    header = @{
+                      title    = 'Preflight ${{ env.tier }} — ${{ env.name }}'
+                      subtitle = ((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm UTC') +
+                                  '  |  Attention: ' + $attention.Count +
+                                  '  Checked: '      + $passed.Count +
+                                  '  Skipped: '      + $skipped.Count)
+                    }
+                    sections = $sections
+                  }
+                })
+              }
+
+              $json = $card | ConvertTo-Json -Depth 20 -Compress
               try {
-                $q = Invoke-AzCostManagementQuery -Scope $scope -Type ActualCost -Timeframe Custom `
-                       -TimePeriodFrom $from -TimePeriodTo $to `
-                       -DatasetGranularity None `
-                       -DatasetAggregation @{ totalCost = @{ name = 'Cost'; function = 'Sum' } } -ErrorAction Stop
-                if ($q.Row -and $q.Row.Count -gt 0 -and $null -ne $q.Row[0][0]) {
-                  return @{ Out = [double]$q.Row[0][0]; Err = '' }
-                }
-                return @{ Out = $null; Err = 'query ok but 0 rows (no billed usage in window)' }
+                Invoke-RestMethod -Method Post -Uri $webhook -ContentType 'application/json; charset=UTF-8' -Body $json | Out-Null
+                Write-Host "Posted 'Preflight ${{ env.tier }} — ${{ env.name }}' card to Google Chat."
               } catch {
-                $msg = ($_.Exception.Message -replace '\s+', ' ').Trim()
-                if (-not $msg) { $msg = 'Invoke-AzCostManagementQuery failed (empty error)' }
-                if ($msg.Length -gt 200) { $msg = $msg.Substring(0, 200) }
-                return @{ Out = $null; Err = $msg }
+                Write-Host ('##[error]Google Chat POST failed: ' + $_.Exception.Message)
+                exit 1
               }
-            }
-
-            $today   = [datetime]::UtcNow.Date
-            $cwEnd   = $today.AddDays(-1);  $cwStart = $today.AddDays(-8)
-            $pwEnd   = $today.AddDays(-9);  $pwStart = $today.AddDays(-15)
-            $cwLabel = 'Current Week (' + $cwStart.ToString('yyyy-MM-dd') + '..' + $cwEnd.ToString('yyyy-MM-dd') + ')'
-            $pwLabel = 'Prior Week ('   + $pwStart.ToString('yyyy-MM-dd') + '..' + $pwEnd.ToString('yyyy-MM-dd') + ')'
-
-            $rgScope = 'subscriptions/' + $sub + '/resourceGroups/' + $rg
-
-            ('"Resource Group",' + (Format-CsvField $cwLabel) + ',' + (Format-CsvField $pwLabel)) |
-              Set-Content -LiteralPath $costCsv
-
-            $rgCw = Get-Cost $rgScope $cwStart $cwEnd
-            $rgPw = Get-Cost $rgScope $pwStart $pwEnd
-
-            $cwVal = '{0:F2}' -f [double](Or-Zero $rgCw.Out)
-            $pwVal = '{0:F2}' -f [double](Or-Zero $rgPw.Out)
-            ((Format-CsvField $rg) + ',' + $cwVal + ',' + $pwVal) | Add-Content -LiteralPath $costCsv
-
-            if ($null -ne $rgCw.Out -or $null -ne $rgPw.Out) {
-              $c = [double](Or-Zero $rgCw.Out); $p = [double](Or-Zero $rgPw.Out)
-              $status = 'OK'
-              $result = 'this $' + ('{0:F2}' -f $c) + ' vs prior $' + ('{0:F2}' -f $p)
-              if ($p -gt 0 -and ((($c - $p) / $p) * 100) -gt $costThreshold) {
-                $status = 'WARNING'
-                $pct = '{0:F1}' -f ((($c - $p) / $p) * 100)
-                $result = $result + ' (+' + $pct + '%)'
-                Add-Note ('Cost up ' + $pct + '% week-over-week')
-              }
-              Add-Summary 'Weekly Cost' $result $status
-            } else {
-              Add-Summary 'Weekly Cost' ('returned nothing — ' + $rgCw.Err) 'FAILED'
-              Add-Note ('Weekly Cost FAILED — rg scope: ' + $rgCw.Err + ". If 403/permission, grant the SP 'Cost Management Reader'.")
-            }
-
-      - task: AzurePowerShell@5
-        displayName: 13. Secure score
-        continueOnError: true
-        inputs:
-          azureSubscription: $(AZURE_SERVICE_CONNECTION)
-          azurePowerShellVersion: LatestVersion
-          pwsh: true
-          ScriptType: InlineScript
-          Inline: |
-            . '$(libps)'
-            $pct = $null
-            try { $pct = (Get-AzSecuritySecureScore -Name 'ascScore' -ErrorAction Stop).PercentageScore }
-            catch {
-              try { $pct = (Get-AzSecuritySecureScore -ErrorAction Stop | Select-Object -First 1).PercentageScore } catch {}
-            }
-            $csvPath = Join-Path $WorkDir '11_Secure_Score.csv'
-            $lines   = @('"Metric","Value"')
-            if ($null -ne $pct -and "$pct" -ne '') {
-              $val = '{0:F0}%' -f ([double]$pct * 100)
-              $lines += '"Secure Score",' + (Format-CsvField $val)
-              Add-Summary 'Secure Score' $val 'OK'
-            } else {
-              $lines += '"Secure Score","unavailable"'
-              Add-Summary 'Secure Score' 'unavailable (Defender plan / permissions)' 'SKIP'
-            }
-            $lines | Set-Content -LiteralPath $csvPath
-
-      - task: Kubernetes@1
-        displayName: 14a. AKS login
-        continueOnError: true
-        inputs:
-          connectionType: Kubernetes Service Connection
-          kubernetesServiceEndpoint: $(aksServiceConnection)
-          command: login
-      - bash: |
-          set -uo pipefail
-          source "$(lib)"
-
-          AKS_NAME=$(kubectl config current-context 2>/dev/null || echo 'unknown')
-
-          PODS=$(kubectl get pods -A -o wide --no-headers 2>/dev/null || true)
-          BAD=$(echo "$PODS" | awk '$4 !~ /^(Running|Completed|Succeeded)$/' || true)
-
-          {
-            echo 'AKSCluster,Namespace,Pod,Status,Node'
-            [ -n "$BAD" ] && echo "$BAD" | awk -v cluster="$AKS_NAME" \
-              'NF { print cluster","$1","$2","$4","$8 }'
-          } > "$WORKDIR/12_AKS_Pods.csv"
-
-          NODES=$(kubectl top nodes --no-headers 2>/dev/null || true)
-          {
-            echo 'Node,CPUcores,CPUpct,Memory,Mempct'
-            [ -n "$NODES" ] && echo "$NODES" | awk 'NF { print $1","$2","$3","$4","$5 }'
-          } > "$WORKDIR/13_AKS_Nodes.csv"
-
-          if   [ -z "$PODS" ];  then summary "AKS Pods/Nodes" "kubectl returned nothing (login failed?)" FAILED
-                                     note "AKS check FAILED — kubectl unreachable."
-          elif [ -n "$BAD" ];   then summary "AKS Pods/Nodes" "unhealthy pods found" WARNING
-                                     note "Pods not Running/Completed found"
-          else                       summary "AKS Pods/Nodes" "all pods healthy" OK
-          fi
-        displayName: 14b. AKS pod/node check
-        continueOnError: true
-
-      - bash: |
-          set -euo pipefail
-          ls "$(workDir)"/*.csv >/dev/null 2>&1 || { echo "No CSVs — nothing to render."; exit 0; }
-          mkdir -p "$(reportDir)"
-          REPORT="$(reportDir)/preflight-report-$(date -u '+%Y-%m-%d-%H%M').xlsx"
-          python3 - "$(workDir)" "$REPORT" "${{ parameters.lookbackDays }}" "${{ parameters.certExpiryWarningDays }}" "${{ parameters.sqlStorageWarnPercent }}" "${{ parameters.errorCountDailyThreshold }}" "${{ parameters.apiLatencyThresholdSeconds }}" "${{ parameters.costIncreasePercentThreshold }}" <<'PY'
-          import csv, glob, os, sys, re
-          import openpyxl
-          from openpyxl.styles import Font, PatternFill, Alignment
-
-          workdir = sys.argv[1]
-          report = sys.argv[2]
-          params = {
-              "Lookback Days": sys.argv[3],
-              "Cert Expiry Warning Days": sys.argv[4],
-              "SQL Storage Warn Percent": sys.argv[5],
-              "Error Count Daily Threshold": sys.argv[6],
-              "API Latency Threshold Seconds": sys.argv[7],
-              "Cost Increase Percent Threshold": sys.argv[8]
-          }
-
-          wb = openpyxl.Workbook()
-          ws = wb.active
-          ws.title = "Preflight Report"
-
-          SEC_FILL = PatternFill("solid", fgColor="F47B20")
-          SEC_FONT = Font(bold=True, color="FFFFFF", size=12)
-          HDR_FILL = PatternFill("solid", fgColor="333333")
-          HDR_FONT = Font(bold=True, color="FFFFFF")
-          ALT_FILL = PatternFill("solid", fgColor="F2F2F2")
-
-          col_widths = {}
-          cur_row = 1
-
-          cell = ws.cell(row=cur_row, column=1, value="Pipeline Parameters")
-          cell.font = SEC_FONT
-          cell.fill = SEC_FILL
-          cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
-          ws.merge_cells(start_row=cur_row, start_column=1, end_row=cur_row, end_column=2)
-          ws.row_dimensions[cur_row].height = 20
-          cur_row += 1
-
-          for c, val in enumerate(["Parameter", "Value"], 1):
-              cell = ws.cell(row=cur_row, column=c, value=val)
-              cell.font = HDR_FONT
-              cell.fill = HDR_FILL
-              col_widths[c] = max(col_widths.get(c, 10), len(str(val)) + 2)
-          cur_row += 1
-
-          i = 0
-          for k, v in params.items():
-              cell_k = ws.cell(row=cur_row, column=1, value=k)
-              cell_v = ws.cell(row=cur_row, column=2, value=v)
-              if i % 2 == 1:
-                  cell_k.fill = ALT_FILL
-                  cell_v.fill = ALT_FILL
-              col_widths[1] = max(col_widths.get(1, 10), len(str(k)) + 2)
-              col_widths[2] = max(col_widths.get(2, 10), len(str(v)) + 2)
-              cur_row += 1
-              i += 1
-
-          cur_row += 1
-
-          def fix_name(text):
-              text = re.sub(r"([A-Z]+)([A-Z][a-z])", r'\1 \2', text)
-              text = re.sub(r"([a-z\d])([A-Z])", r'\1 \2', text)
-              return text.replace("_", " ").strip()
-
-          for path in sorted(glob.glob(os.path.join(workdir, "*.csv"))):
-              stem = os.path.splitext(os.path.basename(path))[0]
-              name = stem.split("_", 1)[-1].replace("_", " ") if stem[:2].isdigit() else stem
-
-              with open(path, newline="") as f:
-                  rows = list(csv.reader(f))
-              if not rows:
-                  continue
-
-              ncols = max(len(r) for r in rows)
-
-              cell = ws.cell(row=cur_row, column=1, value=name)
-              cell.font = SEC_FONT
-              cell.fill = SEC_FILL
-              cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
-              if ncols > 1:
-                  ws.merge_cells(start_row=cur_row, start_column=1, end_row=cur_row, end_column=ncols)
-              ws.row_dimensions[cur_row].height = 20
-              cur_row += 1
-
-              for c, val in enumerate(rows[0], 1):
-                  fixed_val = fix_name(val)
-                  cell = ws.cell(row=cur_row, column=c, value=fixed_val)
-                  cell.font = HDR_FONT
-                  cell.fill = HDR_FILL
-                  col_widths[c] = max(col_widths.get(c, 10), len(str(fixed_val)) + 2)
-              cur_row += 1
-
-              for i, data_row in enumerate(rows[1:]):
-                  for c, val in enumerate(data_row, 1):
-                      cell = ws.cell(row=cur_row, column=c, value=val)
-                      if i % 2 == 1:
-                          cell.fill = ALT_FILL
-                      col_widths[c] = max(col_widths.get(c, 10), len(str(val)) + 2)
-                  cur_row += 1
-
-              cur_row += 1
-
-          for col_idx, width in col_widths.items():
-              ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = min(width, 60)
-
-          wb.save(report)
-          print("Wrote", report, "—", cur_row - 1, "rows")
-          PY
-          echo "##vso[task.setvariable variable=reportPath]$REPORT"
-        displayName: 15. Build .xlsx report
-        condition: always()
-
-      - publish: $(reportDir)
-        artifact: preflight-report
-        displayName: 16. Publish report artifact
-        condition: always()
-
-      - task: AzurePowerShell@5
-        displayName: 17. Upload report to blob (sa18436/preflight)
-        condition: always()
-        inputs:
-          azureSubscription: $(AZURE_SERVICE_CONNECTION)
-          azurePowerShellVersion: LatestVersion
-          pwsh: true
-          ScriptType: InlineScript
-          Inline: |
-            $reportPath = $env:REPORTPATH
-            if (-not $reportPath -or -not (Test-Path -LiteralPath $reportPath)) {
-              Write-Host 'No .xlsx report — nothing to upload.'
-            } else {
-              $acct = '$(storageAccount)'; $rg = '$(resourceGroup)'; $container = '$(blobContainer)'
-              $key = (Get-AzStorageAccountKey -ResourceGroupName $rg -Name $acct)[0].Value
-              $ctx = New-AzStorageContext -StorageAccountName $acct -StorageAccountKey $key
-              if (-not (Get-AzStorageContainer -Name $container -Context $ctx -ErrorAction SilentlyContinue)) {
-                New-AzStorageContainer -Name $container -Context $ctx | Out-Null
-              }
-              $prefix   = 'preflight-' + [datetime]::UtcNow.ToString('yyyy-MM-dd-HHmm')
-              $fileName = Split-Path -Leaf $reportPath
-              Set-AzStorageBlobContent -File $reportPath -Container $container `
-                -Blob ($prefix + '/' + $fileName) -Context $ctx -Force | Out-Null
-              Write-Host ('Uploaded ' + $fileName + ' to ' + $acct + '/' + $container + '/' + $prefix + '/')
-            }
-        env:
-          REPORTPATH: $(reportPath)
-
-      - bash: |
-          set -uo pipefail
-          [ -z "${GCHAT_WEBHOOK_URL:-}" ] && { echo "No webhook — skipping."; exit 0; }
-          CARD_GROUPS=$(python3 - "$(workDir)/00_Summary.csv" <<'PY'
-          import csv, sys, json
-          g = {"passed": [], "attention": [], "skipped": []}
-          with open(sys.argv[1], newline='') as f:
-              r = csv.reader(f); next(r, None)
-              for row in r:
-                  if len(row) < 3: continue
-                  check, res, st = row[0], row[1], row[2]
-                  if check.startswith("Auth:"):
-                      continue
-                  label = f"{check} — {res}" if res else check
-                  if st in ("WARNING", "ALERT", "FAILED"): g["attention"].append(label)
-                  elif st in ("SKIP", "EMPTY"):            g["skipped"].append(label)
-                  else:                                    g["passed"].append(label)
-          for k in g: g[k] = g[k][:30]
-          print(json.dumps(g))
-          PY
-          )
-          BLOB_URL="https://portal.azure.com/#@/resource/subscriptions/$(subscriptionId)/resourceGroups/$(resourceGroup)/providers/Microsoft.Storage/storageAccounts/$(storageAccount)/containersList"
-          PAYLOAD=$(jq -n --argjson g "$CARD_GROUPS" \
-            --arg ts "$(date -u '+%Y-%m-%d %H:%M UTC')" \
-            --arg url "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)" \
-            --arg blob "$BLOB_URL" '
-            def sec(t; icon; items):
-              if (items|length) > 0
-              then {header:(t+" ("+(items|length|tostring)+")"),
-                    widgets:(items|map({decoratedText:{startIcon:{materialIcon:{name:icon}},text:.}}))}
-              else empty end;
-            {cardsV2:[{cardId:"asgardeo-preflight",card:{
-              header:{title:"Preflight",
-                      subtitle:($ts+"  |  Checked:"+($g.passed|length|tostring)+"  Attention:"+($g.attention|length|tostring)+"  Skipped:"+($g.skipped|length|tostring))},
-              sections:([
-                sec("Needs attention";"warning";$g.attention),
-                sec("Checked";"check_circle";$g.passed),
-                sec("Skipped / Not applicable";"do_not_disturb_on";$g.skipped),
-                {widgets:[{buttonList:{buttons:[
-                  {text:"Open pipeline run",onClick:{openLink:{url:$url}}},
-                  {text:"Open blob container",onClick:{openLink:{url:$blob}}}
-                ]}}]}
-              ])}}]}')
-          [ -z "$PAYLOAD" ] && { echo "##[error]Card payload is empty (jq failed) — not posting."; exit 1; }
-          CODE=$(curl -sS -o /tmp/gchat_resp -w '%{http_code}' -H "Content-Type: application/json" -d "$PAYLOAD" "$GCHAT_WEBHOOK_URL")
-          if [ "$CODE" = "200" ]; then
-            echo "Posted 'Preflight' card to Google Chat."
-          else
-            echo "##[error]Google Chat POST failed (HTTP $CODE): $(cat /tmp/gchat_resp)"; exit 1
-          fi
-        displayName: 18. Notify Google Chat
-        condition: always()
-        env:
-          GCHAT_WEBHOOK_URL: $(GCHAT_WEBHOOK_URL)
+            displayName: 12. Notify Google Chat
+            condition: always()
+            env:
+              GCHAT_WEBHOOK_URL: $(GCHAT_WEBHOOK_URL)
