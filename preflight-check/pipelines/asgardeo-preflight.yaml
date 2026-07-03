@@ -1,28 +1,3 @@
-# ============================================================================
-# Weekly Preflight — L1/L2 deployment health (Asgardeo / Nissan PIC)
-#
-# Improved over the original: the ONLY thing a caller supplies is the
-# `environments` object. Everything else (pool, thresholds, lookback) is a
-# pipeline variable, so a new environment is one block — no other params.
-#
-# Coverage (see KQL/PREFLIGHT-SUMMARY.md — each check tagged [row N]):
-#   KQL (Invoke-AzOperationalInsightsQuery, seeded *_CL tables):
-#     [1]  Log ingestion / existency / alert logs
-#     [1]  Frontdoor traffic + 4xx/5xx + traffic-by-tenant
-#     [1]  IS errors + top error tenants
-#     [7]  API latency by bucket
-#     [8]  AKS pod status + node utilization / over-provisioning
-#   Az PowerShell metric / control-plane (auto-discovered, no resource IDs
-#   passed — SKIP cleanly when the resource type is absent in the sub):
-#     [2a] Front Door Total Latency / Request Count   Get-AzMetric
-#     [2b/3] SQL DB CPU + Storage %  (+ growth ALERT)  Get-AzSqlDatabase/Metric
-#     [5]  APIM latency & capacity                     Get-AzMetric
-#     [9]  Key Vault certificate expiry sweep          Get-AzKeyVaultCertificate
-#
-# Az PowerShell only (live AzureRM connection — no az login / az rest).
-# Results go to Google Chat (secret var: GCHAT_WEBHOOK_URL).
-# ============================================================================
-
 trigger: none
 
 schedules:
@@ -60,7 +35,6 @@ variables:
   nodeCpuOverProvisionPercent: 25       # avg CPU below this AND mem below next => over-provisioned
   nodeMemOverProvisionPercent: 50
   dbStoragePercentThreshold: 75         # matches checkAzureSqlDbStorage.sh SAFE/ALERT cutoff
-  apimLatencyThresholdMs: 1000
   certExpiryWarnDays: 60
 
 jobs:
@@ -554,35 +528,6 @@ jobs:
                 }
 
           # ------------------------------------------------------------------
-          # 12. [2a] Front Door Total Latency + Request Count (Get-AzMetric)
-          #     Auto-discovers AFD Std/Premium profiles — SKIP if none.
-          # ------------------------------------------------------------------
-          - task: AzurePowerShell@5
-            displayName: 12. Front Door latency/count (metric)
-            continueOnError: true
-            inputs:
-              azureSubscription: ${{ env.serviceConnection }}
-              azurePowerShellVersion: LatestVersion
-              pwsh: true
-              ScriptType: InlineScript
-              Inline: |
-                . '$(libps)'
-                $profiles = @()
-                try { $profiles = @(Get-AzCdnProfile -ErrorAction Stop) } catch {
-                  Add-Summary 'Frontdoor Latency' (Trim-Err $_.Exception.Message 150) 'FAILED'; return
-                }
-                if (-not $profiles.Count) { Add-Summary 'Frontdoor Latency' 'no Front Door / CDN profile in subscription' 'SKIP'; return }
-                $lines = @()
-                foreach ($p in $profiles) {
-                  $m = Invoke-Metric $p.Id @('TotalLatency','RequestCount') 'Average'
-                  if (-not $m.Ok) { $lines += ($p.Name + '=err'); continue }
-                  $lat = Get-MetricStat $m 'TotalLatency' 'Average' 'Average'
-                  $req = Get-MetricStat $m 'RequestCount' 'Average' 'Maximum'
-                  $lines += ('{0}: latency {1}ms, peak req {2}' -f $p.Name, $lat, $req)
-                }
-                Add-Summary 'Frontdoor Latency' ($lines -join ' | ') 'OK'
-
-          # ------------------------------------------------------------------
           # 13. [2b/3] SQL DB CPU + Storage % (+ growth ALERT vs threshold)
           #     Replaces checkAzureSqlDbStorage.sh — auto-discovers servers.
           # ------------------------------------------------------------------
@@ -646,38 +591,6 @@ jobs:
                 } else {
                   Add-Summary 'DB Storage' ('all below ' + $threshold + '% — ' + $detail) 'OK'
                 }
-
-          # ------------------------------------------------------------------
-          # 14. [5] APIM latency & capacity (Get-AzMetric) — auto-discover
-          # ------------------------------------------------------------------
-          - task: AzurePowerShell@5
-            displayName: 14. APIM latency + capacity (metric)
-            continueOnError: true
-            inputs:
-              azureSubscription: ${{ env.serviceConnection }}
-              azurePowerShellVersion: LatestVersion
-              pwsh: true
-              ScriptType: InlineScript
-              Inline: |
-                . '$(libps)'
-                $svcs = @()
-                try { $svcs = @(Get-AzApiManagement -ErrorAction Stop) } catch {
-                  Add-Summary 'APIM Latency & Capacity' (Trim-Err $_.Exception.Message 150) 'FAILED'; return
-                }
-                if (-not $svcs.Count) { Add-Summary 'APIM Latency & Capacity' 'no APIM service in subscription' 'SKIP'; return }
-                $latThreshold = $(apimLatencyThresholdMs)
-                $lines = @(); $warn = $false
-                foreach ($a in $svcs) {
-                  $m = Invoke-Metric $a.Id @('Duration','Capacity','Requests') 'Average'
-                  if (-not $m.Ok) { $lines += ($a.Name + '=err'); continue }
-                  $dur = Get-MetricStat $m 'Duration' 'Average' 'Average'
-                  $cap = Get-MetricStat $m 'Capacity' 'Average' 'Maximum'
-                  $req = Get-MetricStat $m 'Requests' 'Average' 'Maximum'
-                  if ($dur -ne $null -and $dur -gt $latThreshold) { $warn = $true }
-                  $lines += ('{0}: dur {1}ms, peak cap {2}%, peak req {3}' -f $a.Name, $dur, $cap, $req)
-                }
-                $apimStatus = if ($warn) { 'WARNING' } else { 'OK' }
-                Add-Summary 'APIM Latency & Capacity' ($lines -join ' | ') $apimStatus
 
           # ------------------------------------------------------------------
           # 15. [9] Key Vault certificate expiry sweep (control-plane + data-
@@ -746,10 +659,10 @@ jobs:
               $authChecks = @('Auth: subscription','Auth: Log Analytics')
               $categoryMap = [ordered]@{
                 '1. Log Review & Monitoring' = @('Log Ingestion','Log Existency','Alert Logs Emission')
-                '2. Frontdoor Traffic'       = @('Frontdoor Traffic','Frontdoor HTTP Errors','Frontdoor Latency','Top Traffic Tenants')
+                '2. Frontdoor Traffic'       = @('Frontdoor Traffic','Frontdoor HTTP Errors','Top Traffic Tenants')
                 '3. Application Errors'      = @('IS Errors','Top Error Tenants')
                 '4. Database Health'         = @('DB Storage')
-                '5. API Performance'         = @('API Latency','APIM Latency & Capacity')
+                '5. API Performance'         = @('API Latency')
                 '6. AKS Health & Capacity'   = @('AKS Pods','AKS Node Utilization')
                 '9. Certificates'            = @('Cert Expiry')
               }
