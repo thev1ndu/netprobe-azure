@@ -235,10 +235,10 @@ jobs:
                 Add-Summary 'Log Ingestion' ('peak {0:F2} / avg {1:F2} GB/day' -f $peak, $avg) $status
 
           # ------------------------------------------------------------------
-          # 4. [1.2] Log existency per deployment + [1.3] alert logs emission
+          # 4. [1.3] Alert logs emission
           # ------------------------------------------------------------------
           - task: AzurePowerShell@5
-            displayName: 4. Log existency + alert logs
+            displayName: 4. Alert logs emission
             continueOnError: true
             inputs:
               azureSubscription: ${{ env.serviceConnection }}
@@ -247,24 +247,6 @@ jobs:
               ScriptType: InlineScript
               Inline: |
                 . '$(libps)'
-                $q = Invoke-Kql @'
-                let paramPodNamePrefix = "$(envPodPrefix)";
-                ContainerLog_CL
-                | join kind = inner (KubePodInventory_CL
-                    | project ContainerID_s, PodName = Name_s
-                    | where PodName contains paramPodNamePrefix
-                    | distinct *) on ContainerID_s
-                | project TimeGenerated, deployment = strcat_array(array_slice(split(PodName, "-"), 0, -3), "-")
-                | summarize LogCount = count() by deployment
-                | order by deployment asc
-                '@
-                if (-not $q.Ok)         { Add-Summary 'Log Existency' $q.Err 'FAILED' }
-                elseif (!$q.Rows.Count) { Add-Summary 'Log Existency' 'no logs from any "$(envPodPrefix)" deployment' 'WARNING' }
-                else {
-                  $d = ($q.Rows | ForEach-Object { $_.deployment + '=' + $_.LogCount }) -join ', '
-                  Add-Summary 'Log Existency' $d 'OK'
-                }
-
                 $a = Invoke-Kql @'
                 AlertLogs_CL
                 | summarize AggregatedValue = count() by bin(TimeGenerated, 1d)
@@ -738,7 +720,7 @@ jobs:
 
               # Column order in the sheet = order of this array.
               $checkOrder = @(
-                'Log Ingestion','Log Existency','Alert Logs Emission',
+                'Log Ingestion','Alert Logs Emission',
                 'Frontdoor Traffic','Frontdoor HTTP Errors','Top Traffic Tenants',
                 'IS Errors','Top Error Tenants',
                 'DB Storage','API Latency',
