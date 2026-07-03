@@ -642,7 +642,7 @@ jobs:
                     # list-sql-db-usage.sh reads via `az sql db list-usages`. This is
                     # a LIVE snapshot (no Azure Monitor ingestion lag), so it never
                     # comes back blank like the storage_percent metric did.
-                    $stor = $null; $maxGb = $null
+                    $stor = $null; $maxGb = $null; $usedGb = $null
                     try {
                       $resp = Invoke-AzRestMethod -Method GET -Path ($d.ResourceId + '/usages?api-version=' + $apiVer) -ErrorAction Stop
                       if ($resp.StatusCode -eq 200) {
@@ -650,8 +650,9 @@ jobs:
                         # api-version 2021-11-01 nests the numbers under .properties;
                         # only 'name' is top-level (unlike `az sql db list-usages`, which flattens them).
                         if ($u -and [double]$u.properties.limit -gt 0) {
-                          $stor  = [math]::Round([double]$u.properties.currentValue / [double]$u.properties.limit * 100, 2)
-                          $maxGb = [math]::Round([double]$u.properties.limit / 1GB, 2)
+                          $stor   = [math]::Round([double]$u.properties.currentValue / [double]$u.properties.limit * 100, 2)
+                          $maxGb  = [math]::Round([double]$u.properties.limit / 1GB, 2)
+                          $usedGb = [math]::Round([double]$u.properties.currentValue / 1GB, 2)
                         }
                       }
                     } catch {}
@@ -659,13 +660,15 @@ jobs:
                     $cpu = $null
                     $cm = Invoke-Metric $d.ResourceId @('cpu_percent') 'Maximum'
                     if ($cm.Ok) { $cpu = Get-MetricStat $cm 'cpu_percent' 'Maximum' 'Maximum' }
-                    $rows += [pscustomobject]@{ Db = $d.DatabaseName; Storage = $stor; MaxGB = $maxGb; Cpu = $cpu }
+                    # Per-DB SAFE/ALERT vs threshold (matches list-sql-db-usage.sh); n/a when no usage data.
+                    $st = if ($null -eq $stor) { 'n/a' } elseif ($stor -ge $threshold) { 'ALERT' } else { 'SAFE' }
+                    $rows += [pscustomobject]@{ Db = $d.DatabaseName; Storage = $stor; UsedGB = $usedGb; MaxGB = $maxGb; Cpu = $cpu; Status = $st }
                   }
                 }
                 if (-not $rows.Count) { Add-Summary 'DB Storage' 'servers found but no database usage data' 'EMPTY'; return }
                 $alert  = @($rows | Where-Object { $null -ne $_.Storage -and $_.Storage -ge $threshold })
                 $sorted = $rows | Sort-Object { [double]($_.Storage) } -Descending | Select-Object -First 6
-                $detail = ($sorted | ForEach-Object { '{0}={1}% of {2}GB / cpu {3}%' -f $_.Db, ($_.Storage ?? 'n/a'), ($_.MaxGB ?? 'n/a'), ($_.Cpu ?? 'n/a') }) -join ', '
+                $detail = ($sorted | ForEach-Object { '{0} [{1}]: {2}GB ({3}%) of {4}GB / cpu {5}%' -f $_.Db, $_.Status, ($_.UsedGB ?? 'n/a'), ($_.Storage ?? 'n/a'), ($_.MaxGB ?? 'n/a'), ($_.Cpu ?? 'n/a') }) -join ', '
                 if ($alert.Count) {
                   Add-Summary 'DB Storage' ('ALERT (>=' + $threshold + '%): ' + (($alert | ForEach-Object { $_.Db + '=' + $_.Storage + '%' }) -join ', ') + ' | ' + $detail) 'ALERT'
                 } else {
