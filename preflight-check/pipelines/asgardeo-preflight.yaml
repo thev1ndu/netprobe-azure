@@ -643,8 +643,9 @@ jobs:
                 }
 
           # ------------------------------------------------------------------
-          # 16. Notify Google Chat — minimal status message only.
-          #     Full details go to the Google Sheet (step 17) + pipeline run.
+          # 16. Notify Google Chat — compact THREADED card.
+          #     threadKey = build ID, so all environments of one run stack in
+          #     a single thread. Full details go to the Sheet (step 17).
           # ------------------------------------------------------------------
           - pwsh: |
               $webhook = $env:GCHAT_WEBHOOK_URL
@@ -658,23 +659,61 @@ jobs:
               foreach ($line in Get-Content -LiteralPath $summaryPath) {
                 if (-not $line.Trim()) { continue }
                 $e = $line | ConvertFrom-Json
-                if (([string]$e.status).ToUpper() -in $attentionStatuses) { $issues += [string]$e.check }
+                if (([string]$e.status).ToUpper() -in $attentionStatuses) {
+                  $issues += [pscustomobject]@{ Check = [string]$e.check; Status = ([string]$e.status).ToUpper() }
+                }
               }
 
               $runUrl = '$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)'
               $stamp  = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm UTC')
 
               if ($issues.Count) {
-                $text = "⚠️ *Weekly Preflight $(envTier) — ${{ env.name }}*: finished with $($issues.Count) issue(s): " +
-                        ($issues -join ', ') + " | $stamp | <$runUrl|Open run>"
+                $icon     = 'warning'
+                $verdict  = "Finished with $($issues.Count) issue(s)"
+                $bodyText = ($issues | ForEach-Object { $_.Check + ' — ' + $_.Status }) -join "`n"
               } else {
-                $text = "✅ *Weekly Preflight $(envTier) — ${{ env.name }}*: finished without errors | $stamp | <$runUrl|Open run>"
+                $icon     = 'check_circle'
+                $verdict  = 'Finished without errors'
+                $bodyText = 'All checks passed.'
               }
 
-              $body = @{ text = $text } | ConvertTo-Json -Compress
+              $card = @{
+                # Same threadKey for every environment job of this run — Google
+                # Chat stacks them into one thread per pipeline execution.
+                thread = @{ threadKey = 'preflight-$(Build.BuildId)' }
+                cardsV2 = @(@{
+                  cardId = 'preflight-${{ env.name }}-$(Build.BuildId)'
+                  card = @{
+                    header = @{
+                      title    = 'Weekly Preflight $(envTier) — ${{ env.name }}'
+                      subtitle = ($verdict + '  |  ' + $stamp)
+                    }
+                    sections = @(@{
+                      widgets = @(
+                        @{ decoratedText = @{
+                             startIcon = @{ materialIcon = @{ name = $icon } }
+                             text      = $bodyText
+                             wrapText  = $true
+                           } },
+                        @{ buttonList = @{ buttons = @(
+                             @{ text = 'Open pipeline run'; onClick = @{ openLink = @{ url = $runUrl } } }
+                           ) } }
+                      )
+                    })
+                  }
+                })
+              }
+
+              # messageReplyOption makes the webhook honor threadKey (falls back
+              # to a new thread when the key doesn't exist yet).
+              $uri = $webhook
+              $uri += if ($uri -match '\?') { '&' } else { '?' }
+              $uri += 'messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD'
+
+              $json = $card | ConvertTo-Json -Depth 20 -Compress
               try {
-                Invoke-RestMethod -Method Post -Uri $webhook -ContentType 'application/json; charset=UTF-8' -Body $body | Out-Null
-                Write-Host "Posted preflight status for '${{ env.name }}'."
+                Invoke-RestMethod -Method Post -Uri $uri -ContentType 'application/json; charset=UTF-8' -Body $json | Out-Null
+                Write-Host "Posted threaded preflight card for '${{ env.name }}' (thread preflight-$(Build.BuildId))."
               } catch {
                 Write-Host ('##[error]Google Chat POST failed: ' + $_.Exception.Message)
                 exit 1
