@@ -16,6 +16,7 @@ parameters:
       - name: thevindu-rnd
         tier: L1
         serviceConnection: thevindu-rnd-sc
+        aksServiceConnection: rnd-aks-thevindu
         subscriptionId: 38785beb-5019-4896-8679-3d41ddacc4b1
         resourceGroup: rg-thevindu
         workspaceId: e5d406b5-f761-48a7-9466-9d0d4a768f01
@@ -510,6 +511,130 @@ jobs:
                 }
 
           # ------------------------------------------------------------------
+          # 12. [6.x] AKS LIVE pod details — via the Kubernetes service
+          #     connection, independent of Log Analytics. 12a = inventory
+          #     (jsonpath, single line so it survives the KubectlOutput
+          #     variable), 12b = live CPU/mem from the metrics API (raw JSON
+          #     is single-line), 12c = parse + score.
+          # ------------------------------------------------------------------
+          - task: Kubernetes@1
+            name: AksPodInventory
+            displayName: 12a. AKS live pod inventory
+            continueOnError: true
+            inputs:
+              connectionType: Kubernetes Service Connection
+              kubernetesServiceEndpoint: ${{ env.aksServiceConnection }}
+              command: get
+              arguments: pods --all-namespaces -o jsonpath={range .items[*]}{.metadata.namespace}{"|"}{.metadata.name}{"|"}{.status.phase}{"|"}{.spec.nodeName}{"|"}{.status.podIP}{"|"}{.status.startTime}{"|"}{.status.containerStatuses[*].ready}{"|"}{.status.containerStatuses[*].restartCount}{";"}{end}
+              outputFormat: none
+
+          - task: Kubernetes@1
+            name: AksPodMetrics
+            displayName: 12b. AKS live pod metrics
+            continueOnError: true
+            inputs:
+              connectionType: Kubernetes Service Connection
+              kubernetesServiceEndpoint: ${{ env.aksServiceConnection }}
+              command: get
+              arguments: --raw /apis/metrics.k8s.io/v1beta1/pods
+              outputFormat: none
+
+          - pwsh: |
+              . '$(libps)'
+              $inv = $env:POD_INVENTORY
+              if (-not $inv -or -not $inv.Trim()) {
+                Add-Summary 'AKS Pod Details' 'kubectl returned no pod inventory (check AKS service connection / cluster reachability)' 'FAILED'
+                exit 0
+              }
+
+              # ---- Parse live CPU/mem (metrics-server) into a lookup ----------
+              $usage = @{}
+              if ($env:POD_METRICS -and $env:POD_METRICS.Trim().StartsWith('{')) {
+                try {
+                  $m = $env:POD_METRICS | ConvertFrom-Json
+                  foreach ($item in @($m.items)) {
+                    $cpuMilli = 0.0; $memMi = 0.0
+                    foreach ($c in @($item.containers)) {
+                      $cpu = [string]$c.usage.cpu
+                      $cpuMilli += switch -Regex ($cpu) {
+                        'n$' { [double]($cpu.TrimEnd('n')) / 1e6; break }
+                        'u$' { [double]($cpu.TrimEnd('u')) / 1e3; break }
+                        'm$' { [double]($cpu.TrimEnd('m')); break }
+                        default { try { [double]$cpu * 1000 } catch { 0 } }
+                      }
+                      $mem = [string]$c.usage.memory
+                      $memMi += switch -Regex ($mem) {
+                        'Ki$' { [double]($mem -replace 'Ki$','') / 1024; break }
+                        'Mi$' { [double]($mem -replace 'Mi$',''); break }
+                        'Gi$' { [double]($mem -replace 'Gi$','') * 1024; break }
+                        default { try { [double]$mem / 1MB } catch { 0 } }
+                      }
+                    }
+                    $usage[$item.metadata.namespace + '/' + $item.metadata.name] =
+                      @{ Cpu = [math]::Round($cpuMilli); Mem = [math]::Round($memMi) }
+                  }
+                } catch { Write-Host "##[warning]Could not parse pod metrics: $($_.Exception.Message)" }
+              }
+
+              # ---- Parse inventory records ------------------------------------
+              $now = (Get-Date).ToUniversalTime()
+              $all = @()
+              foreach ($rec in ($inv -split ';')) {
+                if (-not $rec.Trim()) { continue }
+                $f = $rec -split '\|'
+                if ($f.Count -lt 8) { continue }
+                $ready    = @($f[6] -split '\s+' | Where-Object { $_ })
+                $restarts = @($f[7] -split '\s+' | Where-Object { $_ } | ForEach-Object { [int]$_ })
+                $age = ''
+                try {
+                  $span = $now - ([datetime]::Parse($f[5])).ToUniversalTime()
+                  $age = if ($span.TotalDays -ge 1) { [string][int]$span.TotalDays + 'd' } else { [string][int]$span.TotalHours + 'h' }
+                } catch {}
+                $key = $f[0] + '/' + $f[1]
+                $u = $usage[$key]
+                $all += [pscustomobject]@{
+                  Ns = $f[0]; Name = $f[1]; Phase = $f[2]; Node = $f[3]; Ip = $f[4]
+                  Age = $age
+                  ReadyCount = @($ready | Where-Object { $_ -eq 'true' }).Count
+                  TotalCount = $ready.Count
+                  Restarts   = (($restarts | Measure-Object -Sum).Sum ?? 0)
+                  CpuM  = if ($u) { $u.Cpu } else { $null }
+                  MemMi = if ($u) { $u.Mem } else { $null }
+                }
+              }
+              if (-not $all.Count) {
+                Add-Summary 'AKS Pod Details' 'inventory returned but no pods parsed' 'EMPTY'; exit 0
+              }
+
+              # ---- Cluster-wide health + prefix-pod detail ---------------------
+              $unhealthy = @($all | Where-Object { $_.Phase -notin 'Running','Succeeded' -or ($_.TotalCount -gt 0 -and $_.ReadyCount -lt $_.TotalCount) })
+              $mine = @($all | Where-Object { $_.Name -like '$(envPodPrefix)*' })
+
+              function Format-Pod($p) {
+                $cpu = if ($null -ne $p.CpuM)  { [string]$p.CpuM + 'm' }   else { 'n/a' }
+                $mem = if ($null -ne $p.MemMi) { [string]$p.MemMi + 'Mi' } else { 'n/a' }
+                '{0}/{1} [{2}] ready {3}/{4}, restarts {5}, cpu {6}, mem {7}, node {8}, ip {9}, age {10}' -f `
+                  $p.Ns, $p.Name, $p.Phase, $p.ReadyCount, $p.TotalCount, $p.Restarts, $cpu, $mem, $p.Node, $p.Ip, $p.Age
+              }
+
+              $parts = @()
+              if ($mine.Count) { $parts += (($mine | Select-Object -First 8 | ForEach-Object { Format-Pod $_ }) -join ' • ') }
+              else             { $parts += 'no "$(envPodPrefix)*" pods found' }
+              $parts += ('cluster: {0} pod(s), {1} unhealthy' -f $all.Count, $unhealthy.Count)
+              if ($unhealthy.Count) {
+                $parts += 'unhealthy: ' + (($unhealthy | Select-Object -First 5 | ForEach-Object { $_.Ns + '/' + $_.Name + '=' + $_.Phase }) -join ', ')
+              }
+
+              $badMine = @($mine | Where-Object { $_.Phase -ne 'Running' -or $_.ReadyCount -lt $_.TotalCount -or $_.Restarts -gt 5 })
+              $status = if (-not $mine.Count -or $badMine.Count -or $unhealthy.Count) { 'WARNING' } else { 'OK' }
+              Add-Summary 'AKS Pod Details' ($parts -join ' | ') $status
+            displayName: 12c. Parse live pod details
+            continueOnError: true
+            env:
+              POD_INVENTORY: $(AksPodInventory.KubectlOutput)
+              POD_METRICS: $(AksPodMetrics.KubectlOutput)
+
+          # ------------------------------------------------------------------
           # 13. [2b/3] SQL DB CPU + Storage % (+ growth ALERT vs threshold)
           #     Replaces checkAzureSqlDbStorage.sh — auto-discovers servers.
           # ------------------------------------------------------------------
@@ -724,7 +849,7 @@ jobs:
                 'Frontdoor Traffic','Frontdoor HTTP Errors','Top Traffic Tenants',
                 'IS Errors','Top Error Tenants',
                 'DB Storage','API Latency',
-                'AKS Pods','AKS Node Utilization',
+                'AKS Pods','AKS Pod Details','AKS Node Utilization',
                 'Cert Expiry'
               )
 
