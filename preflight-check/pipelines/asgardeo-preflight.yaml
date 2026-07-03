@@ -253,7 +253,8 @@ jobs:
                     Add-Summary ('Table: ' + $t) $q.Err 'FAILED'
                   } else {
                     $n = if ($q.Rows.Count) { [long]$q.Rows[0].Count } else { 0 }
-                    Add-Summary ('Table: ' + $t) ($n.ToString() + ' row(s)') (if ($n -gt 0) { 'OK' } else { 'EMPTY' })
+                    $tStatus = if ($n -gt 0) { 'OK' } else { 'EMPTY' }
+                    Add-Summary ('Table: ' + $t) ($n.ToString() + ' row(s)') $tStatus
                   }
                 }
 
@@ -708,7 +709,8 @@ jobs:
                   if ($dur -ne $null -and $dur -gt $latThreshold) { $warn = $true }
                   $lines += ('{0}: dur {1}ms, peak cap {2}%, peak req {3}' -f $a.Name, $dur, $cap, $req)
                 }
-                Add-Summary 'APIM Latency & Capacity' ($lines -join ' | ') (if ($warn) { 'WARNING' } else { 'OK' })
+                $apimStatus = if ($warn) { 'WARNING' } else { 'OK' }
+                Add-Summary 'APIM Latency & Capacity' ($lines -join ' | ') $apimStatus
 
           # ------------------------------------------------------------------
           # 15. [9] Key Vault certificate expiry sweep (control-plane + data-
@@ -751,9 +753,13 @@ jobs:
                   $near = $near | Sort-Object Days
                   $expired = @($near | Where-Object { $_.Days -lt 0 })
                   $detail  = ($near | Select-Object -First 12 | ForEach-Object { '{0}/{1} expires {2} ({3}d)' -f $_.Vault, $_.Cert, $_.Date, $_.Days }) -join ', '
-                  Add-Summary 'Cert Expiry' ($detail + (if ($denied) { " | ${denied} vault(s) access-denied" } else { '' })) (if ($expired.Count) { 'EXPIRED' } else { 'WARNING' })
+                  if ($denied) { $detail += " | ${denied} vault(s) access-denied" }
+                  $certStatus = if ($expired.Count) { 'EXPIRED' } else { 'WARNING' }
+                  Add-Summary 'Cert Expiry' $detail $certStatus
                 } else {
-                  Add-Summary 'Cert Expiry' ("no certs within ${warnDays}d across ${scanned} cert(s)" + (if ($denied) { " | ${denied} vault(s) access-denied" } else { '' })) 'OK'
+                  $certMsg = "no certs within ${warnDays}d across ${scanned} cert(s)"
+                  if ($denied) { $certMsg += " | ${denied} vault(s) access-denied" }
+                  Add-Summary 'Cert Expiry' $certMsg 'OK'
                 }
 
           # ------------------------------------------------------------------
