@@ -706,7 +706,8 @@ jobs:
                 'Cert Expiry'
               )
 
-              # Fold summary.jsonl into { check = @{ status; result } }
+              # Fold summary.jsonl into a lookup, then emit an ORDERED ARRAY —
+              # the Apps Script writes columns positionally in this order.
               $entries = @{}
               foreach ($line in Get-Content -LiteralPath $summaryPath) {
                 if (-not $line.Trim()) { continue }
@@ -717,9 +718,13 @@ jobs:
                 }
               }
 
-              $checks = [ordered]@{}
+              $checks = @()
               foreach ($name in $checkOrder) {
-                if ($entries.ContainsKey($name)) { $checks[$name] = $entries[$name] }
+                if ($entries.ContainsKey($name)) {
+                  $checks += @{ name = $name; status = $entries[$name].status; result = $entries[$name].result }
+                } else {
+                  $checks += @{ name = $name; status = 'MISSING'; result = '' }
+                }
               }
 
               $payload = @{
