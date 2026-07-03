@@ -643,8 +643,8 @@ jobs:
                 }
 
           # ------------------------------------------------------------------
-          # 16. Notify Google Chat — one cardsV2 card per environment, grouped
-          #     by preflight requirement category, per-item status.
+          # 16. Notify Google Chat — minimal status message only.
+          #     Details live in the Google Sheet (step 17) + pipeline run.
           # ------------------------------------------------------------------
           - pwsh: |
               $webhook = $env:GCHAT_WEBHOOK_URL
@@ -653,124 +653,28 @@ jobs:
               $summaryPath = '$(workDir)/summary.jsonl'
               if (-not (Test-Path -LiteralPath $summaryPath)) { Write-Host '##[error]No summary file.'; exit 1 }
 
-              # Access + data availability are NOT their own sections — they are
-              # rolled up into the header chips below. Everything else is grouped
-              # by preflight requirement category.
-              $authChecks = @('Auth: subscription','Auth: Log Analytics')
-              $categoryMap = [ordered]@{
-                '1. Log Review & Monitoring' = @('Log Ingestion','Log Existency','Alert Logs Emission')
-                '2. Frontdoor Traffic'       = @('Frontdoor Traffic','Frontdoor HTTP Errors','Top Traffic Tenants')
-                '3. Application Errors'      = @('IS Errors','Top Error Tenants')
-                '4. Database Health'         = @('DB Storage')
-                '5. API Performance'         = @('API Latency')
-                '6. AKS Health & Capacity'   = @('AKS Pods','AKS Node Utilization')
-                '9. Certificates'            = @('Cert Expiry')
-              }
-              $statusIcon = @{ OK='check_circle'; WARNING='warning'; FAILED='error'; ALERT='error'; EXPIRED='error'; EMPTY='do_not_disturb_on'; SKIP='do_not_disturb_on' }
               $attentionStatuses = 'WARNING','ALERT','FAILED','EXPIRED'
-
-              $entries = [ordered]@{}
+              $issues = @()
               foreach ($line in Get-Content -LiteralPath $summaryPath) {
                 if (-not $line.Trim()) { continue }
                 $e = $line | ConvertFrom-Json
-                $result = [string]$e.result
-                if ($result.Length -gt 600) { $result = $result.Substring(0, 600) + '…' }
-                $entries[[string]$e.check] = [pscustomobject]@{ Check = [string]$e.check; Result = $result; Status = ([string]$e.status).ToUpper() }
-              }
-
-              # --- Header roll-ups: access + data availability (no sections) ---
-              $accessOk = @($authChecks | Where-Object { $entries.Contains($_) -and $entries[$_].Status -eq 'OK' }).Count -eq $authChecks.Count
-              # "Data present" = at least one Log-Analytics-backed check returned
-              # rows (status other than EMPTY/SKIP/FAILED). Anchored on the core
-              # log tables, so an unseeded workspace reads as "No data".
-              $dataAnchors = @('Log Ingestion','Frontdoor Traffic','IS Errors','AKS Node Utilization')
-              $dataPresent = @($dataAnchors | Where-Object { $entries.Contains($_) -and $entries[$_].Status -notin 'EMPTY','SKIP','FAILED' }).Count -gt 0
-              $accessChip  = if ($accessOk)    { 'Access: OK' }      else { 'Access: FAILED' }
-              $dataChip    = if ($dataPresent) { 'Data: Available' } else { 'Data: Not available' }
-
-              # Tallies exclude the auth checks (they live in the chips instead).
-              $scored     = @($entries.Values | Where-Object { $authChecks -notcontains $_.Check })
-              $nAttention = @($scored | Where-Object { $_.Status -in $attentionStatuses }).Count
-              $nOk        = @($scored | Where-Object { $_.Status -eq 'OK' }).Count
-              $nEmpty     = @($scored | Where-Object { $_.Status -in 'EMPTY','SKIP' }).Count
-
-              function New-ItemWidget($Item) {
-                $icon = $statusIcon[$Item.Status]; if (-not $icon) { $icon = 'help' }
-                @{ decoratedText = @{
-                     startIcon = @{ materialIcon = @{ name = $icon } }
-                     topLabel  = ($Item.Check + '  •  ' + $Item.Status)
-                     text      = if ($Item.Result) { $Item.Result } else { ' ' }
-                     wrapText  = $true
-                   } }
-              }
-
-              $sections = [System.Collections.Generic.List[object]]::new()
-
-              $sections.Add(@{
-                header = 'Environment'
-                collapsible = $true
-                uncollapsibleWidgetsCount = 1
-                widgets = @(
-                  @{ decoratedText = @{ startIcon = @{ materialIcon = @{ name = 'cloud' } }
-                       topLabel = '$(envTier) • $(envRegion)'
-                       text = '${{ env.name }}'; wrapText = $true } },
-                  @{ decoratedText = @{ topLabel = 'Subscription'; text = '${{ env.subscriptionId }}'; wrapText = $true } },
-                  @{ decoratedText = @{ topLabel = 'Resource group / Workspace'; text = '${{ env.resourceGroup }} / ${{ env.workspaceId }}'; wrapText = $true } },
-                  @{ decoratedText = @{ topLabel = 'Pod prefix / Lookback'; text = '$(envPodPrefix) / $(lookbackDays) day(s)'; wrapText = $true } }
-                )
-              })
-
-              $seen = [System.Collections.Generic.HashSet[string]]::new()
-              foreach ($cat in $categoryMap.Keys) {
-                $items = @()
-                foreach ($check in $categoryMap[$cat]) {
-                  if ($entries.Contains($check)) { $items += $entries[$check]; [void]$seen.Add($check) }
-                }
-                if (-not $items.Count) { continue }
-                $catAttention = @($items | Where-Object { $_.Status -in $attentionStatuses }).Count
-                $suffix = if ($catAttention) { ' — ' + $catAttention + ' need attention' } else { ' — OK' }
-                $section = @{
-                  header  = ('{0}{1}' -f $cat, $suffix)
-                  widgets = @($items | ForEach-Object { New-ItemWidget $_ })
-                }
-                if (-not $catAttention) { $section.collapsible = $true; $section.uncollapsibleWidgetsCount = 0 }
-                $sections.Add($section)
-              }
-
-              # Auth checks are represented by the header chips, not a section.
-              foreach ($n in $authChecks) { [void]$seen.Add($n) }
-              $other = @($entries.Values | Where-Object { -not $seen.Contains($_.Check) })
-              if ($other.Count) {
-                $sections.Add(@{ header = 'Other checks'; widgets = @($other | ForEach-Object { New-ItemWidget $_ }) })
+                if (([string]$e.status).ToUpper() -in $attentionStatuses) { $issues += [string]$e.check }
               }
 
               $runUrl = '$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)'
-              $sections.Add(@{ widgets = @(@{ buttonList = @{ buttons = @(
-                @{ text = 'Open pipeline run'; onClick = @{ openLink = @{ url = $runUrl } } }
-              ) } }) })
+              $stamp  = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm UTC')
 
-              $overall = if ($nAttention -or -not $accessOk) { 'NEEDS ATTENTION' } else { 'ALL CLEAR' }
-              $card = @{
-                cardsV2 = @(@{
-                  cardId = 'preflight-${{ env.name }}'
-                  card = @{
-                    header = @{
-                      title    = 'Weekly Preflight $(envTier) — ${{ env.name }}'
-                      subtitle = ($overall + '  |  ' + $accessChip + '  |  ' + $dataChip + '  |  ' +
-                                  (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm UTC') +
-                                  '  |  Attention: ' + $nAttention + '   OK: ' + $nOk + '   Empty: ' + $nEmpty)
-                    }
-                    sections = $sections
-                  }
-                })
+              if ($issues.Count) {
+                $text = "⚠️ *Weekly Preflight $(envTier) — ${{ env.name }}*: finished with $($issues.Count) issue(s): " +
+                        ($issues -join ', ') + " | $stamp | <$runUrl|Open run>"
+              } else {
+                $text = "✅ *Weekly Preflight $(envTier) — ${{ env.name }}*: finished without errors | $stamp | <$runUrl|Open run>"
               }
 
-              $json  = $card | ConvertTo-Json -Depth 20 -Compress
-              $bytes = [System.Text.Encoding]::UTF8.GetByteCount($json)
-              if ($bytes -gt 45000) { Write-Host "##[warning]Card payload ${bytes} bytes — near Google Chat's ~50KB limit." }
+              $body = @{ text = $text } | ConvertTo-Json -Compress
               try {
-                Invoke-RestMethod -Method Post -Uri $webhook -ContentType 'application/json; charset=UTF-8' -Body $json | Out-Null
-                Write-Host "Posted preflight card for '${{ env.name }}' ($bytes bytes)."
+                Invoke-RestMethod -Method Post -Uri $webhook -ContentType 'application/json; charset=UTF-8' -Body $body | Out-Null
+                Write-Host "Posted preflight status for '${{ env.name }}'."
               } catch {
                 Write-Host ('##[error]Google Chat POST failed: ' + $_.Exception.Message)
                 exit 1
@@ -779,3 +683,67 @@ jobs:
             condition: always()
             env:
               GCHAT_WEBHOOK_URL: $(GCHAT_WEBHOOK_URL)
+
+          # ------------------------------------------------------------------
+          # 17. Notify Google Sheet — one row per environment per run.
+          #     Pairs with preflight-sheet-webapp.gs (Apps Script Web App).
+          #     Secrets required: GSHEET_WEBAPP_URL, GSHEET_SECRET.
+          # ------------------------------------------------------------------
+          - pwsh: |
+              $url = $env:GSHEET_WEBAPP_URL
+              if (-not $url) { Write-Host 'No GSHEET_WEBAPP_URL — skipping sheet update.'; exit 0 }
+
+              $summaryPath = '$(workDir)/summary.jsonl'
+              if (-not (Test-Path -LiteralPath $summaryPath)) { Write-Host '##[error]No summary file.'; exit 1 }
+
+              # Column order must match CHECKS in the Apps Script.
+              $checkOrder = @(
+                'Log Ingestion','Log Existency','Alert Logs Emission',
+                'Frontdoor Traffic','Frontdoor HTTP Errors','Top Traffic Tenants',
+                'IS Errors','Top Error Tenants',
+                'DB Storage','API Latency',
+                'AKS Pods','AKS Node Utilization',
+                'Cert Expiry'
+              )
+
+              # Fold summary.jsonl into { check = @{ status; result } }
+              $entries = @{}
+              foreach ($line in Get-Content -LiteralPath $summaryPath) {
+                if (-not $line.Trim()) { continue }
+                $e = $line | ConvertFrom-Json
+                $entries[[string]$e.check] = @{
+                  status = ([string]$e.status).ToUpper()
+                  result = [string]$e.result
+                }
+              }
+
+              $checks = [ordered]@{}
+              foreach ($name in $checkOrder) {
+                if ($entries.ContainsKey($name)) { $checks[$name] = $entries[$name] }
+              }
+
+              $payload = @{
+                secret      = $env:GSHEET_SECRET
+                timestamp   = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm UTC')
+                environment = '${{ env.name }}'
+                checks      = $checks
+              } | ConvertTo-Json -Depth 5 -Compress
+
+              try {
+                # Apps Script answers a POST with a 302 to script.googleusercontent.com;
+                # doPost has already run by then, so follow the redirect and read the JSON.
+                $resp = Invoke-RestMethod -Method Post -Uri $url `
+                          -ContentType 'application/json; charset=UTF-8' `
+                          -Body $payload -MaximumRedirection 5
+                if ($resp.ok) { Write-Host "Sheet row appended (row $($resp.row)) for '${{ env.name }}'." }
+                else          { Write-Host ('##[warning]Sheet responded: ' + ($resp | ConvertTo-Json -Compress)) }
+              } catch {
+                # Some PowerShell versions choke converting the redirected POST to GET —
+                # doPost still executed, so downgrade to a warning rather than fail the job.
+                Write-Host ('##[warning]Google Sheet POST: ' + $_.Exception.Message)
+              }
+            displayName: 17. Notify Google Sheet
+            condition: always()
+            env:
+              GSHEET_WEBAPP_URL: $(GSHEET_WEBAPP_URL)
+              GSHEET_SECRET: $(GSHEET_SECRET)
