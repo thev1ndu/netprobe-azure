@@ -9,7 +9,7 @@
 #   KQL (Invoke-AzOperationalInsightsQuery, seeded *_CL tables):
 #     [1]  Log ingestion / existency / alert logs
 #     [1]  Frontdoor traffic + 4xx/5xx + traffic-by-tenant
-#     [1]  IS errors + top error tenants + long-running scripts
+#     [1]  IS errors + top error tenants
 #     [7]  API latency by bucket
 #     [8]  AKS pod status + node utilization / over-provisioning
 #   Az PowerShell metric / control-plane (auto-discovered, no resource IDs
@@ -461,34 +461,6 @@ jobs:
                 else      { Add-Summary 'Top Error Tenants' 'none' 'EMPTY' }
 
           # ------------------------------------------------------------------
-          # 9. [3.5] Long-running script detection
-          # ------------------------------------------------------------------
-          - task: AzurePowerShell@5
-            displayName: 9. Long-running scripts
-            continueOnError: true
-            inputs:
-              azureSubscription: ${{ env.serviceConnection }}
-              azurePowerShellVersion: LatestVersion
-              pwsh: true
-              ScriptType: InlineScript
-              Inline: |
-                . '$(libps)'
-                $q = Invoke-Kql @'
-                ContainerLog_CL
-                | join kind = inner (KubePodInventory_CL
-                    | project ContainerID_s, PodName = Name_s
-                    | where PodName hasprefix "$(envPodPrefix)"
-                    | distinct *) on ContainerID_s
-                | where LogEntry_s has "The script took too much time to execute"
-                | project TimeGenerated, deployment = strcat_array(array_slice(split(PodName, "-"), 0, -3), "-")
-                | summarize Count = count() by deployment
-                '@
-                if (-not $q.Ok)     { Add-Summary 'Long-Running Scripts' $q.Err 'FAILED'; return }
-                if (!$q.Rows.Count) { Add-Summary 'Long-Running Scripts' 'none detected' 'OK'; return }
-                $d = ($q.Rows | ForEach-Object { $_.deployment + '=' + $_.Count }) -join ', '
-                Add-Summary 'Long-Running Scripts' $d 'WARNING'
-
-          # ------------------------------------------------------------------
           # 10. [5.1] API latency by API call bucket
           # ------------------------------------------------------------------
           - task: AzurePowerShell@5
@@ -775,7 +747,7 @@ jobs:
               $categoryMap = [ordered]@{
                 '1. Log Review & Monitoring' = @('Log Ingestion','Log Existency','Alert Logs Emission')
                 '2. Frontdoor Traffic'       = @('Frontdoor Traffic','Frontdoor HTTP Errors','Frontdoor Latency','Top Traffic Tenants')
-                '3. Application Errors'      = @('IS Errors','Top Error Tenants','Long-Running Scripts')
+                '3. Application Errors'      = @('IS Errors','Top Error Tenants')
                 '4. Database Health'         = @('DB Storage')
                 '5. API Performance'         = @('API Latency','APIM Latency & Capacity')
                 '6. AKS Health & Capacity'   = @('AKS Pods','AKS Node Utilization')
