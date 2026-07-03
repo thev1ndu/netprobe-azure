@@ -647,9 +647,11 @@ jobs:
                       $resp = Invoke-AzRestMethod -Method GET -Path ($d.ResourceId + '/usages?api-version=' + $apiVer) -ErrorAction Stop
                       if ($resp.StatusCode -eq 200) {
                         $u = ($resp.Content | ConvertFrom-Json).value | Where-Object { $_.name -eq 'database_size' } | Select-Object -First 1
-                        if ($u -and [double]$u.limit -gt 0) {
-                          $stor  = [math]::Round([double]$u.currentValue / [double]$u.limit * 100, 2)
-                          $maxGb = [math]::Round([double]$u.limit / 1GB, 2)
+                        # api-version 2021-11-01 nests the numbers under .properties;
+                        # only 'name' is top-level (unlike `az sql db list-usages`, which flattens them).
+                        if ($u -and [double]$u.properties.limit -gt 0) {
+                          $stor  = [math]::Round([double]$u.properties.currentValue / [double]$u.properties.limit * 100, 2)
+                          $maxGb = [math]::Round([double]$u.properties.limit / 1GB, 2)
                         }
                       }
                     } catch {}
