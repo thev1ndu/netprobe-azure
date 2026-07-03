@@ -234,31 +234,6 @@ jobs:
                 else           { Add-Summary 'Auth: Log Analytics' $probe.Err 'FAILED' }
 
           # ------------------------------------------------------------------
-          # 2b. Table existence probe — isolates "table not found / still
-          #     indexing" from real query-logic bugs in the checks below.
-          # ------------------------------------------------------------------
-          - task: AzurePowerShell@5
-            displayName: 2b. Table existence probe
-            continueOnError: true
-            inputs:
-              azureSubscription: ${{ env.serviceConnection }}
-              azurePowerShellVersion: LatestVersion
-              pwsh: true
-              ScriptType: InlineScript
-              Inline: |
-                . '$(libps)'
-                foreach ($t in 'Usage_CL','FrontdoorLog_CL','ContainerLog_CL','KubePodInventory_CL','NodePerf_CL','AlertLogs_CL') {
-                  $q = Invoke-Kql ($t + ' | count')
-                  if (-not $q.Ok) {
-                    Add-Summary ('Table: ' + $t) $q.Err 'FAILED'
-                  } else {
-                    $n = if ($q.Rows.Count) { [long]$q.Rows[0].Count } else { 0 }
-                    $tStatus = if ($n -gt 0) { 'OK' } else { 'EMPTY' }
-                    Add-Summary ('Table: ' + $t) ($n.ToString() + ' row(s)') $tStatus
-                  }
-                }
-
-          # ------------------------------------------------------------------
           # 3. [1.1] Log ingestion volume
           # ------------------------------------------------------------------
           - task: AzurePowerShell@5
@@ -773,9 +748,11 @@ jobs:
               $summaryPath = '$(workDir)/summary.jsonl'
               if (-not (Test-Path -LiteralPath $summaryPath)) { Write-Host '##[error]No summary file.'; exit 1 }
 
+              # Access + data availability are NOT their own sections — they are
+              # rolled up into the header chips below. Everything else is grouped
+              # by preflight requirement category.
+              $authChecks = @('Auth: subscription','Auth: Log Analytics')
               $categoryMap = [ordered]@{
-                'Access & Prerequisites'     = @('Auth: subscription', 'Auth: Log Analytics')
-                'Data Availability'          = @('Table: Usage_CL','Table: FrontdoorLog_CL','Table: ContainerLog_CL','Table: KubePodInventory_CL','Table: NodePerf_CL','Table: AlertLogs_CL')
                 '1. Log Review & Monitoring' = @('Log Ingestion','Log Existency','Alert Logs Emission')
                 '2. Frontdoor Traffic'       = @('Frontdoor Traffic','Frontdoor HTTP Errors','Frontdoor Latency','Top Traffic Tenants')
                 '3. Application Errors'      = @('IS Errors','Top Error Tenants','Long-Running Scripts')
@@ -796,9 +773,21 @@ jobs:
                 $entries[[string]$e.check] = [pscustomobject]@{ Check = [string]$e.check; Result = $result; Status = ([string]$e.status).ToUpper() }
               }
 
-              $nAttention = @($entries.Values | Where-Object { $_.Status -in $attentionStatuses }).Count
-              $nOk        = @($entries.Values | Where-Object { $_.Status -eq 'OK' }).Count
-              $nEmpty     = @($entries.Values | Where-Object { $_.Status -in 'EMPTY','SKIP' }).Count
+              # --- Header roll-ups: access + data availability (no sections) ---
+              $accessOk = @($authChecks | Where-Object { $entries.Contains($_) -and $entries[$_].Status -eq 'OK' }).Count -eq $authChecks.Count
+              # "Data present" = at least one Log-Analytics-backed check returned
+              # rows (status other than EMPTY/SKIP/FAILED). Anchored on the core
+              # log tables, so an unseeded workspace reads as "No data".
+              $dataAnchors = @('Log Ingestion','Frontdoor Traffic','IS Errors','AKS Node Utilization')
+              $dataPresent = @($dataAnchors | Where-Object { $entries.Contains($_) -and $entries[$_].Status -notin 'EMPTY','SKIP','FAILED' }).Count -gt 0
+              $accessChip  = if ($accessOk)    { 'Access: OK' }      else { 'Access: FAILED' }
+              $dataChip    = if ($dataPresent) { 'Data: Available' } else { 'Data: Not available' }
+
+              # Tallies exclude the auth checks (they live in the chips instead).
+              $scored     = @($entries.Values | Where-Object { $authChecks -notcontains $_.Check })
+              $nAttention = @($scored | Where-Object { $_.Status -in $attentionStatuses }).Count
+              $nOk        = @($scored | Where-Object { $_.Status -eq 'OK' }).Count
+              $nEmpty     = @($scored | Where-Object { $_.Status -in 'EMPTY','SKIP' }).Count
 
               function New-ItemWidget($Item) {
                 $icon = $statusIcon[$Item.Status]; if (-not $icon) { $icon = 'help' }
@@ -834,7 +823,7 @@ jobs:
                 }
                 if (-not $items.Count) { continue }
                 $catAttention = @($items | Where-Object { $_.Status -in $attentionStatuses }).Count
-                $suffix = if ($catAttention) { '  ⚠ ' + $catAttention } else { '  ✓' }
+                $suffix = if ($catAttention) { ' — ' + $catAttention + ' need attention' } else { ' — OK' }
                 $section = @{
                   header  = ('{0}{1}' -f $cat, $suffix)
                   widgets = @($items | ForEach-Object { New-ItemWidget $_ })
@@ -843,6 +832,8 @@ jobs:
                 $sections.Add($section)
               }
 
+              # Auth checks are represented by the header chips, not a section.
+              foreach ($n in $authChecks) { [void]$seen.Add($n) }
               $other = @($entries.Values | Where-Object { -not $seen.Contains($_.Check) })
               if ($other.Count) {
                 $sections.Add(@{ header = 'Other checks'; widgets = @($other | ForEach-Object { New-ItemWidget $_ }) })
@@ -853,16 +844,16 @@ jobs:
                 @{ text = 'Open pipeline run'; onClick = @{ openLink = @{ url = $runUrl } } }
               ) } }) })
 
-              $overall = if ($nAttention) { '⚠ NEEDS ATTENTION' } else { '✅ ALL CLEAR' }
+              $overall = if ($nAttention -or -not $accessOk) { 'NEEDS ATTENTION' } else { 'ALL CLEAR' }
               $card = @{
                 cardsV2 = @(@{
                   cardId = 'preflight-${{ env.name }}'
                   card = @{
                     header = @{
                       title    = 'Weekly Preflight $(envTier) — ${{ env.name }}'
-                      subtitle = ($overall + '  |  ' +
+                      subtitle = ($overall + '  |  ' + $accessChip + '  |  ' + $dataChip + '  |  ' +
                                   (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm UTC') +
-                                  '  |  ⚠ ' + $nAttention + '  ✓ ' + $nOk + '  ∅ ' + $nEmpty)
+                                  '  |  Attention: ' + $nAttention + '   OK: ' + $nOk + '   Empty: ' + $nEmpty)
                     }
                     sections = $sections
                   }
