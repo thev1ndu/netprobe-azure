@@ -15,7 +15,6 @@ parameters:
       - name: dev-test
         serviceConnection: thevindu-rnd-sc
         aksServiceConnection: rnd-aks-thevindu
-        subscriptionId: 38785beb-5019-4896-8679-3d41ddacc4b1
         resourceGroup: rg-thevindu
         workspaceId: e5d406b5-f761-48a7-9466-9d0d4a768f01
         podNamePrefix: is-identity-server
@@ -654,7 +653,7 @@ jobs:
                   $expired = @($near | Where-Object { $_.Days -lt 0 })
                   $detail  = ($near | Select-Object -First 12 | ForEach-Object { '{0}/{1} expires {2} ({3}d)' -f $_.Vault, $_.Cert, $_.Date, $_.Days }) -join ', '
                   if ($denied) { $detail += " | ${denied} vault(s) access-denied" }
-                  $certStatus = if ($expired.Count) { 'EXPIRED' } else { 'WARNING' }
+                  $certStatus = if ($expired.Count) { 'ALERT' } else { 'WARNING' }
                   Add-Summary 'Cert Expiry' $detail $certStatus
                 } else {
                   $certMsg = "no certs within ${warnDays}d across ${scanned} cert(s)"
