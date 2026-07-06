@@ -719,7 +719,7 @@ jobs:
                 'Frontdoor Traffic','Frontdoor HTTP Errors','Top Traffic Tenants',
                 'IS Errors','Top Error Tenants',
                 'DB Storage','API Latency',
-                'AKS Pods','AKS Pod Details','AKS Node Count','AKS Node Utilization',
+                'Pods','Pod Details','Node Count','Node Utilization',
                 'Cert Expiry'
               )
 
