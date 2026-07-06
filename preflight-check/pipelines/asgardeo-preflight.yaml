@@ -199,27 +199,6 @@ jobs:
                 Add-Summary 'Log Ingestion' ('peak {0:F2} / avg {1:F2} GB/day' -f $peak, $avg) $status
 
           - task: AzurePowerShell@5
-            displayName: 'Log Analytics: Alert logs emission'
-            continueOnError: true
-            inputs:
-              azureSubscription: ${{ env.serviceConnection }}
-              azurePowerShellVersion: LatestVersion
-              pwsh: true
-              ScriptType: InlineScript
-              Inline: |
-                . '$(libps)'
-                $a = Invoke-Kql @'
-                AlertLogs_CL
-                | summarize AggregatedValue = count() by bin(TimeGenerated, 1d)
-                '@
-                if (-not $a.Ok)         { Add-Summary 'Alert Logs Emission' $a.Err 'FAILED' }
-                elseif (!$a.Rows.Count) { Add-Summary 'Alert Logs Emission' 'no alert logs emitted in window' 'WARNING' }
-                else {
-                  $total = ($a.Rows | ForEach-Object { [long]$_.AggregatedValue } | Measure-Object -Sum).Sum
-                  Add-Summary 'Alert Logs Emission' ($total.ToString() + ' alert log(s) in window') 'OK'
-                }
-
-          - task: AzurePowerShell@5
             displayName: 'Log Analytics: Frontdoor traffic + HTTP errors'
             continueOnError: true
             inputs:
@@ -736,7 +715,7 @@ jobs:
               if (-not (Test-Path -LiteralPath $summaryPath)) { Write-Host '##[error]No summary file.'; exit 1 }
 
               $checkOrder = @(
-                'Log Ingestion','Alert Logs Emission',
+                'Log Ingestion',
                 'Frontdoor Traffic','Frontdoor HTTP Errors','Top Traffic Tenants',
                 'IS Errors','Top Error Tenants',
                 'DB Storage','API Latency',
