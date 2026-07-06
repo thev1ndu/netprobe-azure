@@ -13,17 +13,18 @@ parameters:
   - name: environments
     type: object
     default:
-      - name: thevindu-rnd
+      - name: dev-test
         tier: L1
         serviceConnection: thevindu-rnd-sc
         aksServiceConnection: rnd-aks-thevindu
         subscriptionId: 38785beb-5019-4896-8679-3d41ddacc4b1
         resourceGroup: rg-thevindu
         workspaceId: e5d406b5-f761-48a7-9466-9d0d4a768f01
+        podNamePrefix: is-identity-server
         # Optional per-env overrides (sensible defaults applied below if absent):
         #   tier            L1 (Asgardeo) | L2 (Nissan PIC)
         #   region          US | EU  (label only)
-        #   podNamePrefix   defaults to 'wso2is'
+        # podNamePrefix   defaults to 'wso2is'
 
 # ---- Everything else is infra config, not a caller concern ----------------
 variables:
