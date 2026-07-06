@@ -495,8 +495,10 @@ jobs:
                 $nodeMin = $(envNodeCountMin)
                 $nodeMax = $(envNodeCountMax)
                 $countMsg = '{0} node(s) (min {1} / max {2})' -f $nodeCount, $nodeMin, $nodeMax
-                if ($nodeCount -gt $nodeMin) {
-                  Add-Summary 'AKS Node Count' ($countMsg + ' — above floor, possibly over-provisioned') 'WARNING'
+                if ($nodeCount -lt $nodeMin) {
+                  Add-Summary 'AKS Node Count' ($countMsg + ' — below floor, under-provisioned') 'WARNING'
+                } elseif ($nodeCount -gt $nodeMax) {
+                  Add-Summary 'AKS Node Count' ($countMsg + ' — above ceiling, possibly over-provisioned') 'WARNING'
                 } else {
                   Add-Summary 'AKS Node Count' $countMsg 'OK'
                 }
