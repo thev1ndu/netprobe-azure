@@ -170,7 +170,7 @@ stages:
 
           - bash: |
               wget -q -O "$(Agent.TempDirectory)/netprobe.tgz" \
-                "https://github.com/thev1ndu/netprobe-helm/releases/download/netprobe-0.1.0/netprobe-0.1.0.tgz"
+                "https://github.com/thev1ndu/netprobe-helm/releases/download/netprobe-0.1.1/netprobe-0.1.1.tgz"
             displayName: Download NetProbe Helm Chart
 
           - task: HelmDeploy@0
